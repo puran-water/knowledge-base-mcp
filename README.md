@@ -17,6 +17,7 @@ A production-grade **Model Context Protocol (MCP)** server that puts a state-of-
 - **Client-Orchestrated Summaries & HyDE**: LLM clients contribute section summaries via `ingest.generate_summary` and generate context-aware HyDE hypotheses locally before re-querying `kb.dense`, with every decision recorded in plan provenance.
 - **Observability & Guardrails**: Search logs include hashed subject IDs, stage-level timings, and top hits; `eval.py` runs gold sets with recall/nDCG/latency thresholds for CI gating.
 - **MCP Integration**: Works seamlessly with Claude Desktop, Claude Code, Codex CLI, and any MCP-compliant client.
+- **MCP Best Practices**: All 31 tools include standardized annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`), Pydantic input validation, pagination metadata, and comprehensive docstrings.
 - **Agent Playbooks**: Ready-to-run "retrieve → assess → refine" workflows for Claude and other MCP clients are documented in [`CLAUDE.md`](CLAUDE.md) and [`.codex/AGENTS.md`](.codex/AGENTS.md).
 
 > **Experimental / optional features** such as SPLADE sparse expansion, ColBERT late interaction, automatic summaries/outlines, HyDE query expansion, and enforced canary QA require additional services or configuration. See the status table below for details.
@@ -28,6 +29,10 @@ A production-grade **Model Context Protocol (MCP)** server that puts a state-of-
 | Core dense / hybrid / sparse retrieval | ✅ Working | `kb.search`, `kb.dense`, `kb.hybrid`, `kb.sparse`, `kb.batch` |
 | Entity extraction + graph link-outs | ✅ Working | `kb.entities`, `kb.linkouts`, `kb.graph` (entity→chunk relationships) |
 | Table retrieval | ✅ Working (data-dependent) | Requires tables extracted during ingestion |
+| MCP tool annotations | ✅ Working | All 31 tools have `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint` |
+| Pydantic input validation | ✅ Working | `models.py` provides validated input models with field constraints |
+| Pagination metadata | ✅ Working | Search results include `count`, `retrieve_k`, `return_k`, `has_more` |
+| Async HTTP client | ✅ Working | Embeddings and reranker use `httpx.AsyncClient` for better concurrency |
 | Canary QA | ⚠️ Requires user config | Default `config/canaries/*.json` are placeholders; add queries to enforce gates |
 | Document summaries / outlines | ⚠️ Client-provided | `ingest.generate_summary` stores semantic summaries with provenance; outlines still require building the heading index |
 | HyDE retry | ⚠️ Client-generated | There is no server tool; draft the hypothesis in your MCP client, then re-query `kb.dense` / `kb.search` with it |

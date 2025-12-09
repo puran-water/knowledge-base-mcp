@@ -7,12 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **MCP Tool Annotations**: All 31 tools now include standardized annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) for MCP client compatibility
+- **Pydantic Input Models**: New `models.py` with Pydantic v2 input validation models for all tools, providing field constraints (min/max length, numeric bounds) and better error messages
+- **Pagination Metadata**: All search tools now return consistent pagination fields (`count`, `retrieve_k`, `return_k`, `has_more`, `top_k` where applicable)
+- **Comprehensive Docstrings**: Key tools now include detailed docstrings with Args/Returns sections following MCP best practices
+- **httpx Async Client**: Migrated embedding and reranker HTTP calls from synchronous `requests` to async `httpx.AsyncClient` for better concurrency
+
 ### Changed (Breaking)
 - **Docling-only extraction**: Removed per-page routing and triage logic
 - **Removed `--extractor` CLI flag**: Docling is now the only extractor
 - **Performance improvement**: ~60-65% faster ingestion (9.5h → 3.3-4.8h for 747-page corpus)
 - **Default batch size**: Increased from 32 to 128 for better embedding throughput
 - **Recommended chunk size**: Now 700 chars (was 1800) for reranker compatibility
+- **kb.search signature**: Now accepts Pydantic `KBSearchInput` model for validated input
+
+### Dependencies
+- Added `httpx>=0.25.0` for async HTTP client support
 
 ### Documentation
 - **CRITICAL: Mandatory neighbor expansion for all searches**: Documented that `kb.neighbors(n=10)` is MANDATORY after every search, not optional (CLAUDE.md, AGENTS.md, USAGE.md, FAQ.md)

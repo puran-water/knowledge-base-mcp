@@ -11,11 +11,44 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from enum import Enum
 
 import requests
+import httpx
 from fastmcp import FastMCP, Context
 from qdrant_client import QdrantClient
 import sqlite3
 
 from document_store import DocumentStore, get_subjects_from_context
+from models import (
+    IngestExtractInput,
+    IngestValidateExtractionInput,
+    IngestChunkInput,
+    IngestGenerateMetadataInput,
+    IngestAssessQualityInput,
+    IngestEnhanceInput,
+    IngestUpsertInput,
+    IngestUpsertBatchInput,
+    IngestGenerateSummaryInput,
+    IngestCorpusUpsertInput,
+    KBSearchInput,
+    KBSparseInput,
+    KBSparseSpladeInput,
+    KBDenseInput,
+    KBHybridInput,
+    KBRerankInput,
+    KBColbertInput,
+    KBBatchInput,
+    KBQualityInput,
+    KBHintInput,
+    KBTableInput,
+    KBOpenInput,
+    KBNeighborsInput,
+    KBSummaryInput,
+    KBOutlineInput,
+    KBEntitiesInput,
+    KBLinkoutsInput,
+    KBGraphInput,
+    KBPromoteInput,
+    KBDemoteInput,
+)
 from graph_builder import (
     entity_linkouts as graph_entity_linkouts,
     list_entities as graph_list_entities,
@@ -207,25 +240,34 @@ def _summarize(values: List[float]) -> Optional[Dict[str, float]]:
 
 
 async def embed_query(text: str, normalize: bool = True) -> List[float]:
+    """Generate embedding vector for query text using Ollama.
+
+    Uses native async httpx for non-blocking HTTP calls.
+
+    Args:
+        text: Query text to embed
+        normalize: Whether to L2-normalize the vector (default: True)
+
+    Returns:
+        List[float]: Embedding vector
+    """
     try:
-        r = await asyncio.to_thread(
-            requests.post,
-            f"{OLLAMA_URL}/api/embed",
-            json={"model": OLLAMA_MODEL, "input": [text]},
-            timeout=60,
-        )
-        if r.status_code == 404:
-            r2 = await asyncio.to_thread(
-                requests.post,
-                f"{OLLAMA_URL}/api/embeddings",
-                json={"model": OLLAMA_MODEL, "prompt": text},
-                timeout=60,
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{OLLAMA_URL}/api/embed",
+                json={"model": OLLAMA_MODEL, "input": [text]},
             )
-            r2.raise_for_status()
-            v = r2.json().get("embedding")
-        else:
-            r.raise_for_status()
-            v = r.json().get("embeddings", [[ ]])[0]
+            if r.status_code == 404:
+                # Fallback to older Ollama API
+                r2 = await client.post(
+                    f"{OLLAMA_URL}/api/embeddings",
+                    json={"model": OLLAMA_MODEL, "prompt": text},
+                )
+                r2.raise_for_status()
+                v = r2.json().get("embedding")
+            else:
+                r.raise_for_status()
+                v = r.json().get("embeddings", [[]])[0]
         return l2norm(v) if normalize else v
     except Exception:
         logger.exception("embed_query failed")
@@ -286,18 +328,17 @@ async def _run_colbert(
     limit = max(return_k, min(retrieve_k, 64))
     start = time.perf_counter()
     try:
-        resp = await asyncio.to_thread(
-            requests.post,
-            f"{COLBERT_URL.rstrip('/')}/query",
-            json={
-                "collection": collection,
-                "query": query,
-                "k": limit,
-            },
-            timeout=COLBERT_TIMEOUT,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        async with httpx.AsyncClient(timeout=float(COLBERT_TIMEOUT)) as client:
+            resp = await client.post(
+                f"{COLBERT_URL.rstrip('/')}/query",
+                json={
+                    "collection": collection,
+                    "query": query,
+                    "k": limit,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
         if isinstance(data, dict):
             hits = data.get("results") or data.get("hits") or []
         else:
@@ -1011,8 +1052,27 @@ def _record_client_decisions(
     _save_plan(doc_id, plan)
 
 
-@mcp.tool(name="ingest.extract_with_strategy", title="Ingest: Extract Blocks")
+@mcp.tool(name="ingest.extract_with_strategy", title="Ingest: Extract Blocks", annotations={
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+})
 async def ingest_extract(ctx: Context, path: str, plan: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Extract document blocks using Docling.
+
+    Processes a document file to extract structured blocks (paragraphs,
+    tables, headings, figures) with metadata. Creates blocks artifact.
+
+    Args:
+        ctx: MCP context with session metadata
+        path: Absolute path to document file (PDF, DOCX, etc.)
+        plan: Optional extraction plan with doc_id, triage, chunk_profile
+
+    Returns:
+        Dict with doc_id, block_count, artifact path, plan_hash
+        Error dict if file not found or extraction fails
+    """
     plan = plan or {}
     if not path:
         return {"error": "missing_path"}
@@ -1073,7 +1133,12 @@ async def ingest_extract(ctx: Context, path: str, plan: Optional[Dict[str, Any]]
     }
 
 
-@mcp.tool(name="ingest.validate_extraction", title="Ingest: Validate Extraction")
+@mcp.tool(name="ingest.validate_extraction", title="Ingest: Validate Extraction", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def ingest_validate_extraction(
     ctx: Context,
     artifact_ref: str,
@@ -1136,8 +1201,29 @@ async def ingest_validate_extraction(
     }
 
 
-@mcp.tool(name="ingest.chunk_with_guidance", title="Ingest: Chunk Blocks")
+@mcp.tool(name="ingest.chunk_with_guidance", title="Ingest: Chunk Blocks", annotations={
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def ingest_chunk(ctx: Context, artifacts_ref: str, profile: str = "auto", max_chars: int = 1800, overlap_sentences: int = 1) -> Dict[str, Any]:
+    """Chunk extracted blocks into retrieval-sized pieces.
+
+    Splits document blocks into chunks suitable for embedding and retrieval.
+    Multiple profiles available for different document types.
+
+    Args:
+        ctx: MCP context with session metadata
+        artifacts_ref: Path to blocks artifact from extraction
+        profile: Chunking strategy - auto/fixed_window/heading_based/procedure_block/table_row
+        max_chars: Maximum characters per chunk (default 1800, recommend 700 for reranker)
+        overlap_sentences: Sentence overlap between chunks (default 1)
+
+    Returns:
+        Dict with doc_id, chunk_count, chunk_profile, plan_hash, artifact path
+        Includes sample_chunks preview
+    """
     if not artifacts_ref:
         return {"error": "missing_artifact"}
     try:
@@ -1229,7 +1315,12 @@ async def ingest_chunk(ctx: Context, artifacts_ref: str, profile: str = "auto", 
     }
 
 
-@mcp.tool(name="ingest.generate_metadata", title="Ingest: Generate Metadata")
+@mcp.tool(name="ingest.generate_metadata", title="Ingest: Generate Metadata", annotations={
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def ingest_generate_metadata(ctx: Context, doc_id: str, artifact_ref: Optional[str] = None, policy: str = "strict_v1") -> Dict[str, Any]:
     if not doc_id:
         return {"error": "missing_doc_id"}
@@ -1289,7 +1380,12 @@ async def ingest_generate_metadata(ctx: Context, doc_id: str, artifact_ref: Opti
     }
 
 
-@mcp.tool(name="ingest.assess_quality", title="Ingest: Assess Quality")
+@mcp.tool(name="ingest.assess_quality", title="Ingest: Assess Quality", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def ingest_assess_quality(ctx: Context, doc_id: str, artifact_ref: Optional[str] = None) -> Dict[str, Any]:
     if not doc_id:
         return {"error": "missing_doc_id"}
@@ -1351,7 +1447,12 @@ async def ingest_assess_quality(ctx: Context, doc_id: str, artifact_ref: Optiona
     }
 
 
-@mcp.tool(name="ingest.enhance", title="Ingest: Enhance Artifacts")
+@mcp.tool(name="ingest.enhance", title="Ingest: Enhance Artifacts", annotations={
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def ingest_enhance(ctx: Context, doc_id: str, op: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     supported_ops = {"add_synonyms", "link_crossrefs", "fix_table_pages"}
     if not doc_id:
@@ -1427,7 +1528,12 @@ async def ingest_enhance(ctx: Context, doc_id: str, op: str, args: Optional[Dict
     }
 
 
-@mcp.tool(name="ingest.upsert", title="Ingest: Upsert Document")
+@mcp.tool(name="ingest.upsert", title="Ingest: Upsert Document", annotations={
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": True,
+    "openWorldHint": True,
+})
 async def ingest_upsert_tool(
     ctx: Context,
     doc_id: str,
@@ -1443,6 +1549,29 @@ async def ingest_upsert_tool(
     client_model: Optional[str] = None,
     client_decisions: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    """Upsert document chunks to Qdrant and FTS database.
+
+    Final ingestion step: embeds chunks, upserts to Qdrant vector store,
+    and indexes in SQLite FTS5. Deterministic chunk IDs enable safe re-runs.
+
+    Args:
+        ctx: MCP context with session metadata
+        doc_id: Document identifier from extraction
+        collection: Target Qdrant collection name
+        chunks_artifact: Path to chunks JSON (uses default if None)
+        metadata_artifact: Optional path to metadata JSON
+        thin_payload: Store minimal payload in vectors (saves memory)
+        skip_vectors: Skip vector embedding (FTS only)
+        update_graph: Update knowledge graph links
+        update_summary: Update summary index
+        fts_rebuild: Recreate FTS index from scratch
+        client_id: Client identifier for provenance
+        client_model: Model used for client decisions
+        client_decisions: List of decision objects for audit trail
+
+    Returns:
+        Dict with status, doc_id, chunk_count, collection, timings
+    """
     if not doc_id:
         return {"error": "missing_doc_id"}
     if chunks_artifact:
@@ -1518,7 +1647,12 @@ async def ingest_upsert_tool(
     return result
 
 
-@mcp.tool(name="ingest.upsert_batch", title="Ingest: Batch Upsert")
+@mcp.tool(name="ingest.upsert_batch", title="Ingest: Batch Upsert", annotations={
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": True,
+    "openWorldHint": True,
+})
 async def ingest_upsert_batch(
     ctx: Context,
     upserts: List[Dict[str, Any]],
@@ -1588,7 +1722,12 @@ async def ingest_upsert_batch(
     }
 
 
-@mcp.tool(name="ingest.generate_summary", title="Ingest: Store Summary")
+@mcp.tool(name="ingest.generate_summary", title="Ingest: Store Summary", annotations={
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def ingest_generate_summary_tool(
     ctx: Context,
     doc_id: str,
@@ -1684,7 +1823,12 @@ async def ingest_generate_summary_tool(
     }
 
 
-@mcp.tool(name="ingest.corpus_upsert", title="Ingest: Corpus Upsert")
+@mcp.tool(name="ingest.corpus_upsert", title="Ingest: Corpus Upsert", annotations={
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": True,
+    "openWorldHint": True,
+})
 async def ingest_corpus_upsert(
     ctx: Context,
     root_path: str,
@@ -2438,15 +2582,14 @@ async def _run_rerank(
     texts = [str((h.payload or {}).get("text") or "")[:RERANK_MAX_CHARS] for h in hits]
     try:
         start = time.perf_counter()
-        rr = await asyncio.to_thread(
-            requests.post,
-            f"{TEI_RERANK_URL}/rerank",
-            json={"query": query, "texts": texts, "raw_scores": False},
-            timeout=90,
-        )
-        rr.raise_for_status()
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            rr = await client.post(
+                f"{TEI_RERANK_URL}/rerank",
+                json={"query": query, "texts": texts, "raw_scores": False},
+            )
+            rr.raise_for_status()
+            data = rr.json()
         timings["rerank_ms"] = timings.get("rerank_ms", 0.0) + (time.perf_counter() - start) * 1000.0
-        data = rr.json()
         if isinstance(data, list):
             order = sorted(data, key=lambda r: r.get("score", 0.0), reverse=True)
         else:
@@ -2649,15 +2792,14 @@ async def _run_hybrid(
     texts = [str(x.get("text") or "")[:RERANK_MAX_CHARS] for x in fused]
     try:
         start = time.perf_counter()
-        rr = await asyncio.to_thread(
-            requests.post,
-            f"{TEI_RERANK_URL}/rerank",
-            json={"query": query, "texts": texts, "raw_scores": False},
-            timeout=90,
-        )
-        rr.raise_for_status()
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            rr = await client.post(
+                f"{TEI_RERANK_URL}/rerank",
+                json={"query": query, "texts": texts, "raw_scores": False},
+            )
+            rr.raise_for_status()
+            data = rr.json()
         timings["rerank_ms"] = timings.get("rerank_ms", 0.0) + (time.perf_counter() - start) * 1000.0
-        data = rr.json()
         if isinstance(data, list):
             order = sorted(data, key=lambda r: r.get("score", 0.0), reverse=True)
         else:
@@ -2880,7 +3022,12 @@ def _get_fts_db_path(collection_name: str) -> str:
 
 # ---- Unified retrieval tools (collection parameter required) --------------
 
-@mcp.tool(name="kb.sparse", title="KB: Sparse Search")
+@mcp.tool(name="kb.sparse", title="KB: Sparse Search", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+})
 async def kb_sparse(
     ctx: Context,
     query: str,
@@ -2890,6 +3037,30 @@ async def kb_sparse(
     scope: Optional[Dict[str, Any]] = None,
     response_profile: str = "slim",
 ) -> Dict[str, Any]:
+    """Full-text search using FTS5 BM25 ranking.
+
+    Performs lexical search across the knowledge base using SQLite FTS5 with
+    BM25 scoring. Best for exact term matching, acronyms, and technical terms.
+
+    Args:
+        ctx: MCP context with session metadata
+        query: Search query text (will be tokenized)
+        collection: Target collection slug or name (uses default if None)
+        retrieve_k: Number of candidates to retrieve (1-256, default 24)
+        return_k: Number of results to return (1-256, default 8)
+        scope: Optional dict with doc_id boosts {"boosts": {"doc_id": weight}}
+        response_profile: Detail level - slim/full/diagnostic (default slim)
+
+    Returns:
+        Dict with:
+            - rows: List of matching chunks with scores
+            - count: Number of results returned
+            - retrieve_k/return_k: Pagination parameters used
+            - has_more: Whether more results exist beyond return_k
+            - best_score: Highest BM25 score in results
+            - timings: Performance metrics (fts_ms)
+            - abstain: True if best_score below answerability threshold
+    """
     if not isinstance(query, str) or not query.strip():
         return {"error": "empty_query"}
     slug, collection_name, _ = _resolve_scope(collection)
@@ -2910,11 +3081,15 @@ async def kb_sparse(
     )
     best = _best_score(rows)
     profile = _normalize_response_profile(response_profile)
-    rows = [prune_row(row, profile) for row in rows]
+    pruned_rows = [prune_row(row, profile) for row in rows]
     result = {
         "collection": collection_name,
         "slug": slug,
-        "rows": rows,
+        "rows": pruned_rows,
+        "count": len(pruned_rows),
+        "retrieve_k": retrieve_k,
+        "return_k": return_k,
+        "has_more": len(rows) >= return_k,
         "timings": {k: round(v, 3) for k, v in timings.items()},
         "route": "sparse",
         "best_score": best,
@@ -2929,7 +3104,12 @@ async def kb_sparse(
         })
     return result
 
-@mcp.tool(name="kb.sparse_splade", title="KB: SPLADE Sparse Search")
+@mcp.tool(name="kb.sparse_splade", title="KB: SPLADE Sparse Search", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+})
 async def kb_sparse_splade(
     ctx: Context,
     query: str,
@@ -2939,6 +3119,24 @@ async def kb_sparse_splade(
     scope: Optional[Dict[str, Any]] = None,
     response_profile: str = "slim",
 ) -> Dict[str, Any]:
+    """SPLADE-enhanced sparse search with learned term expansion.
+
+    Uses SPLADE neural model to expand query terms before FTS5 search,
+    improving recall for semantic variants. Requires SPLADE service running.
+
+    Args:
+        ctx: MCP context with session metadata
+        query: Search query text
+        collection: Target collection slug or name (uses default if None)
+        retrieve_k: Number of candidates to retrieve (1-256, default 24)
+        return_k: Number of results to return (1-256, default 8)
+        scope: Optional dict with doc_id boosts {"boosts": {"doc_id": weight}}
+        response_profile: Detail level - slim/full/diagnostic (default slim)
+
+    Returns:
+        Dict with rows, count, pagination metadata, best_score, timings
+        Error dict if SPLADE service unavailable or query empty
+    """
     if not HAVE_SPARSE_SPLADE:
         return {"error": "sparse_expander_disabled"}
     if not isinstance(query, str) or not query.strip():
@@ -2961,11 +3159,15 @@ async def kb_sparse_splade(
     )
     best = _best_score(rows)
     profile = _normalize_response_profile(response_profile)
-    rows = [prune_row(row, profile) for row in rows]
+    pruned_rows = [prune_row(row, profile) for row in rows]
     result = {
         "collection": collection_name,
         "slug": slug,
-        "rows": rows,
+        "rows": pruned_rows,
+        "count": len(pruned_rows),
+        "retrieve_k": retrieve_k,
+        "return_k": return_k,
+        "has_more": len(rows) >= return_k,
         "timings": {k: round(v, 3) for k, v in timings.items()},
         "route": "sparse_splade",
         "best_score": best,
@@ -2980,7 +3182,12 @@ async def kb_sparse_splade(
         })
     return result
 
-@mcp.tool(name="kb.dense", title="KB: Dense Search")
+@mcp.tool(name="kb.dense", title="KB: Dense Search", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+})
 async def kb_dense(
     ctx: Context,
     query: str,
@@ -2990,6 +3197,24 @@ async def kb_dense(
     scope: Optional[Dict[str, Any]] = None,
     response_profile: str = "slim",
 ) -> Dict[str, Any]:
+    """Pure vector similarity search using embeddings.
+
+    Performs semantic search by embedding the query and finding nearest
+    neighbors in vector space. Best for conceptual/semantic matching.
+
+    Args:
+        ctx: MCP context with session metadata
+        query: Search query text (will be embedded)
+        collection: Target collection slug or name (uses default if None)
+        retrieve_k: Number of candidates to retrieve (1-256, default 24)
+        return_k: Number of results to return (1-256, default 8)
+        scope: Optional dict with doc_id boosts {"boosts": {"doc_id": weight}}
+        response_profile: Detail level - slim/full/diagnostic (default slim)
+
+    Returns:
+        Dict with rows, count, pagination metadata, best_score, timings
+        Includes embed_ms timing for embedding latency
+    """
     if not isinstance(query, str) or not query.strip():
         return {"error": "empty_query"}
     slug, collection_name, _ = _resolve_scope(collection)
@@ -3011,11 +3236,15 @@ async def kb_dense(
     )
     best = _best_score(rows)
     profile = _normalize_response_profile(response_profile)
-    rows = [prune_row(row, profile) for row in rows]
+    pruned_rows = [prune_row(row, profile) for row in rows]
     result = {
         "collection": collection_name,
         "slug": slug,
-        "rows": rows,
+        "rows": pruned_rows,
+        "count": len(pruned_rows),
+        "retrieve_k": retrieve_k,
+        "return_k": return_k,
+        "has_more": len(rows) >= return_k,
         "timings": {k: round(v, 3) for k, v in timings.items()},
         "route": "semantic",
         "best_score": best,
@@ -3030,7 +3259,12 @@ async def kb_dense(
         })
     return result
 
-@mcp.tool(name="kb.hybrid", title="KB: Hybrid Search")
+@mcp.tool(name="kb.hybrid", title="KB: Hybrid Search", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+})
 async def kb_hybrid(
     ctx: Context,
     query: str,
@@ -3041,6 +3275,25 @@ async def kb_hybrid(
     scope: Optional[Dict[str, Any]] = None,
     response_profile: str = "slim",
 ) -> Dict[str, Any]:
+    """Hybrid search combining dense vectors and sparse FTS5.
+
+    Retrieves candidates using both semantic embeddings and BM25 lexical
+    matching, then merges results using reciprocal rank fusion (RRF).
+
+    Args:
+        ctx: MCP context with session metadata
+        query: Search query text
+        collection: Target collection slug or name (uses default if None)
+        retrieve_k: Candidates per route before merge (1-256, default 24)
+        return_k: Final results to return (1-256, default 8)
+        top_k: Top-k for RRF merge stage (default 8)
+        scope: Optional dict with doc_id boosts {"boosts": {"doc_id": weight}}
+        response_profile: Detail level - slim/full/diagnostic (default slim)
+
+    Returns:
+        Dict with rows, count, pagination metadata, best_score, timings
+        Timings include embed_ms, vector_ms, fts_ms, merge_ms
+    """
     if not isinstance(query, str) or not query.strip():
         return {"error": "empty_query"}
     slug, collection_name, _ = _resolve_scope(collection)
@@ -3064,11 +3317,16 @@ async def kb_hybrid(
     )
     best = _best_score(rows)
     profile = _normalize_response_profile(response_profile)
-    rows = [prune_row(row, profile) for row in rows]
+    pruned_rows = [prune_row(row, profile) for row in rows]
     result = {
         "collection": collection_name,
         "slug": slug,
-        "rows": rows,
+        "rows": pruned_rows,
+        "count": len(pruned_rows),
+        "retrieve_k": retrieve_k,
+        "return_k": return_k,
+        "top_k": top_k,
+        "has_more": len(rows) >= return_k,
         "timings": {k: round(v, 3) for k, v in timings.items()},
         "route": "hybrid",
         "best_score": best,
@@ -3083,7 +3341,12 @@ async def kb_hybrid(
         })
     return result
 
-@mcp.tool(name="kb.rerank", title="KB: Rerank Search")
+@mcp.tool(name="kb.rerank", title="KB: Rerank Search", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+})
 async def kb_rerank(
     ctx: Context,
     query: str,
@@ -3094,6 +3357,26 @@ async def kb_rerank(
     scope: Optional[Dict[str, Any]] = None,
     response_profile: str = "slim",
 ) -> Dict[str, Any]:
+    """Two-stage search: vector retrieval then cross-encoder reranking.
+
+    First retrieves candidates via dense vector search, then applies a
+    cross-encoder reranker (TEI) for precise relevance scoring. Recommended
+    default for most queries - balances recall and precision.
+
+    Args:
+        ctx: MCP context with session metadata
+        query: Search query text
+        collection: Target collection slug or name (uses default if None)
+        retrieve_k: Dense retrieval candidates (1-128, default 24)
+        return_k: Final results after reranking (1-256, default 8)
+        top_k: Candidates sent to reranker (default 8)
+        scope: Optional dict with doc_id boosts {"boosts": {"doc_id": weight}}
+        response_profile: Detail level - slim/full/diagnostic (default slim)
+
+    Returns:
+        Dict with rows, count, pagination metadata, best_score, timings
+        Timings include embed_ms, vector_ms, rerank_ms
+    """
     if not isinstance(query, str) or not query.strip():
         return {"error": "empty_query"}
     slug, collection_name, _ = _resolve_scope(collection)
@@ -3122,6 +3405,11 @@ async def kb_rerank(
         "collection": collection_name,
         "slug": slug,
         "rows": rows,
+        "count": len(rows),
+        "retrieve_k": retrieve_k,
+        "return_k": return_k,
+        "top_k": top_k,
+        "has_more": len(rows) >= return_k,
         "timings": {k: round(v, 3) for k, v in timings.items()},
         "route": "rerank",
         "best_score": best,
@@ -3136,7 +3424,12 @@ async def kb_rerank(
         })
     return result
 
-@mcp.tool(name="kb.colbert", title="KB: ColBERT Search")
+@mcp.tool(name="kb.colbert", title="KB: ColBERT Search", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+})
 async def kb_colbert(
     ctx: Context,
     query: str,
@@ -3146,6 +3439,25 @@ async def kb_colbert(
     scope: Optional[Dict[str, Any]] = None,
     response_profile: str = "slim",
 ) -> Dict[str, Any]:
+    """Late-interaction search using ColBERT token-level matching.
+
+    Uses ColBERT's MaxSim scoring for fine-grained token-level relevance.
+    Requires ColBERT service (RAGatouille) running. Best for complex queries
+    where token-level matching matters.
+
+    Args:
+        ctx: MCP context with session metadata
+        query: Search query text
+        collection: Target collection slug or name (uses default if None)
+        retrieve_k: Number of candidates to retrieve (1-256, default 24)
+        return_k: Number of results to return (1-256, default 8)
+        scope: Optional dict with doc_id boosts {"boosts": {"doc_id": weight}}
+        response_profile: Detail level - slim/full/diagnostic (default slim)
+
+    Returns:
+        Dict with rows, count, pagination metadata, best_score, timings
+        Error dict if ColBERT service unavailable or query empty
+    """
     if not isinstance(query, str) or not query.strip():
         return {"error": "empty_query"}
     if not HAVE_COLBERT:
@@ -3173,6 +3485,10 @@ async def kb_colbert(
         "collection": collection_name,
         "slug": slug,
         "rows": rows,
+        "count": len(rows),
+        "retrieve_k": retrieve_k,
+        "return_k": return_k,
+        "has_more": len(rows) >= return_k,
         "timings": {k: round(v, 3) for k, v in timings.items()},
         "route": "colbert",
         "best_score": best,
@@ -3187,7 +3503,12 @@ async def kb_colbert(
         })
     return result
 
-@mcp.tool(name="kb.batch", title="KB: Batch Search")
+@mcp.tool(name="kb.batch", title="KB: Batch Search", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+})
 async def kb_batch(
     ctx: Context,
     queries: List[str],
@@ -3200,6 +3521,28 @@ async def kb_batch(
     scopes: Optional[List[Dict[str, Any]]] = None,
     response_profile: str = "slim",
 ) -> Dict[str, Any]:
+    """Execute multiple search queries in a single call.
+
+    Processes multiple queries sequentially with per-query route and
+    collection overrides. Useful for query rephrasing or multi-aspect search.
+
+    Args:
+        ctx: MCP context with session metadata
+        queries: List of search query strings
+        routes: Optional per-query routes (sparse/semantic/rerank/hybrid/colbert/auto)
+        collection: Default collection for all queries
+        collections: Optional per-query collection overrides
+        retrieve_k: Candidates per query (1-256, default 24)
+        return_k: Results per query (1-256, default 8)
+        scope: Default scope/boosts for all queries
+        scopes: Optional per-query scope overrides
+        response_profile: Detail level - slim/full/diagnostic (default slim)
+
+    Returns:
+        Dict with results list, each containing:
+            - index, query, route, collection, rows, count, best_score, timings
+            - has_more, retrieve_k, return_k pagination metadata
+    """
     if not isinstance(queries, list) or not queries:
         return {"error": "missing_queries"}
     retrieve_k = max(1, min(int(retrieve_k), 256))
@@ -3273,6 +3616,10 @@ async def kb_batch(
                 "collection": collection_name,
                 "slug": slug,
                 "rows": rows,
+                "count": len(rows),
+                "retrieve_k": route_retrieve,
+                "return_k": return_k,
+                "has_more": len(rows) >= return_k,
                 "timings": {k: round(v, 3) for k, v in timings.items()},
                 "best_score": best,
             }
@@ -3289,7 +3636,12 @@ async def kb_batch(
             results.append({"index": idx, "query": q, "route": route_norm, "error": str(exc)})
     return {"results": results}
 
-@mcp.tool(name="kb.quality", title="KB: Inspect Hits")
+@mcp.tool(name="kb.quality", title="KB: Inspect Hits", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def kb_quality(
     ctx: Context,
     hits: List[Dict[str, Any]],
@@ -3366,7 +3718,12 @@ async def kb_quality(
         "analysis": analysis,
     }
 
-@mcp.tool(name="kb.hint", title="KB: Sparse Hints")
+@mcp.tool(name="kb.hint", title="KB: Sparse Hints", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def kb_hint(
     ctx: Context,
     term: Optional[str] = None,
@@ -3424,7 +3781,12 @@ def _expand_table_query(query: str) -> str:
     return expanded_query
 
 
-@mcp.tool(name="kb.table", title="KB: Table Lookup")
+@mcp.tool(name="kb.table", title="KB: Table Lookup", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+})
 async def kb_table(
     ctx: Context,
     query: str,
@@ -3433,6 +3795,22 @@ async def kb_table(
     limit: int = 10,
     where: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Search for table rows matching a query.
+
+    Specialized search that filters to chunks with type='table_row'.
+    Best for structured data extraction from tables in documents.
+
+    Args:
+        ctx: MCP context with session metadata
+        query: Search terms (expanded to OR query internally)
+        collection: Target collection (uses default if None)
+        doc_id: Limit search to specific document
+        limit: Max rows to return (1-50, default 10)
+        where: Key-value filter dict - both key and value must appear in text
+
+    Returns:
+        Dict with rows (table_row chunks), collection, query, limit
+    """
     if not isinstance(query, str) or not query.strip():
         return {"error": "empty_query"}
     slug, collection_name, _ = _resolve_scope(collection)
@@ -3488,7 +3866,12 @@ async def kb_table(
         "limit": limit,
     }
 
-@mcp.tool(name="kb.open", title="KB: Open Chunk")
+@mcp.tool(name="kb.open", title="KB: Open Chunk", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def kb_open(
     ctx: Context,
     chunk_id: Optional[str] = None,
@@ -3497,6 +3880,23 @@ async def kb_open(
     start: Optional[int] = None,
     end: Optional[int] = None,
 ) -> Dict[str, Any]:
+    """Retrieve a specific chunk by ID with optional text slicing.
+
+    Fetches full chunk data including text, metadata, and document info.
+    Can look up by chunk_id UUID or element_id from ingestion.
+
+    Args:
+        ctx: MCP context with session metadata
+        chunk_id: Chunk UUID to retrieve (preferred)
+        element_id: Alternative: element ID from ingestion
+        collection: Target collection (uses default if None)
+        start: Optional start offset for text slicing
+        end: Optional end offset for text slicing
+
+    Returns:
+        Dict with chunk_id, text, doc_id, path, section_path, metadata
+        Error dict if chunk not found or access denied
+    """
     slug, collection_name, _ = _resolve_scope(collection)
     fts_db_path = _get_fts_db_path(collection_name)
     target = chunk_id or _lookup_chunk_by_element(element_id or "", fts_db_path=fts_db_path)
@@ -3534,7 +3934,12 @@ async def kb_open(
     })
     return row
 
-@mcp.tool(name="kb.neighbors", title="KB: Neighbor Chunks")
+@mcp.tool(name="kb.neighbors", title="KB: Neighbor Chunks", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def kb_neighbors(
     ctx: Context,
     chunk_id: str,
@@ -3542,6 +3947,29 @@ async def kb_neighbors(
     n: int = 1,
     response_profile: str = "slim",
 ) -> List[Dict[str, Any]]:
+    """Retrieve neighboring chunks for context expansion.
+
+    Given a reference chunk_id, returns n chunks before and n chunks after
+    from the same document, sorted by chunk_start position. Essential for
+    reconstructing context around search results.
+
+    CRITICAL: With 700-char chunks, use n=10 (21 chunks total) to capture
+    complete tables, procedures, or multi-paragraph context. Never rely on
+    a single chunk alone.
+
+    Args:
+        ctx: MCP context with session metadata
+        chunk_id: Reference chunk UUID to anchor the window
+        collection: Target collection (auto-discovers if None)
+        n: Neighbor radius - returns n before + reference + n after (default 1)
+        response_profile: Detail level - slim/full/diagnostic (default slim)
+
+    Returns:
+        List of chunks sorted by chunk_start position, including:
+            - chunk_id, text, doc_id, path, section_path
+            - chunk_start, chunk_end, page_numbers
+            - is_reference: True for the anchor chunk
+    """
     if not chunk_id:
         return [{"error": "missing_chunk_id"}]
 
@@ -3613,7 +4041,12 @@ async def kb_neighbors(
     })
     return rows
 
-@mcp.tool(name="kb.summary", title="KB: Section Summary")
+@mcp.tool(name="kb.summary", title="KB: Section Summary", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def kb_summary(
     ctx: Context,
     topic: str,
@@ -3635,7 +4068,12 @@ async def kb_summary(
         return [{"info": "no_matches"}]
     return results
 
-@mcp.tool(name="kb.outline", title="KB: Outline")
+@mcp.tool(name="kb.outline", title="KB: Outline", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def kb_outline(ctx: Context, doc_id: str, collection: Optional[str] = None) -> Dict[str, Any]:
     if not doc_id:
         return {"error": "missing_doc_id"}
@@ -3672,7 +4110,12 @@ async def kb_outline(ctx: Context, doc_id: str, collection: Optional[str] = None
     })
     return {"doc_id": doc_id, "outline": outline}
 
-@mcp.tool(name="kb.entities", title="KB: Graph Entities")
+@mcp.tool(name="kb.entities", title="KB: Graph Entities", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def kb_entities(
     ctx: Context,
     collection: Optional[str] = None,
@@ -3700,7 +4143,12 @@ async def kb_entities(
         "entities": data,
     }
 
-@mcp.tool(name="kb.linkouts", title="KB: Entity Mentions")
+@mcp.tool(name="kb.linkouts", title="KB: Entity Mentions", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def kb_linkouts(
     ctx: Context,
     entity_id: str,
@@ -3719,7 +4167,12 @@ async def kb_linkouts(
         return {"error": "not_found"}
     return data
 
-@mcp.tool(name="kb.graph", title="KB: Graph Neighbors")
+@mcp.tool(name="kb.graph", title="KB: Graph Neighbors", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def kb_graph(
     ctx: Context,
     node_id: str,
@@ -3733,7 +4186,12 @@ async def kb_graph(
         return {"error": "not_found"}
     return data
 
-@mcp.tool(name="kb.promote", title="KB: Promote Doc")
+@mcp.tool(name="kb.promote", title="KB: Promote Doc", annotations={
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": False,
+})
 async def kb_promote(ctx: Context, doc_id: str, weight: float = 0.2) -> Dict[str, Any]:
     if not doc_id:
         return {"error": "missing_doc_id"}
@@ -3752,7 +4210,12 @@ async def kb_promote(ctx: Context, doc_id: str, weight: float = 0.2) -> Dict[str
         "multiplier": multiplier,
     }
 
-@mcp.tool(name="kb.demote", title="KB: Demote Doc")
+@mcp.tool(name="kb.demote", title="KB: Demote Doc", annotations={
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": False,
+})
 async def kb_demote(ctx: Context, doc_id: str, weight: float = 0.2) -> Dict[str, Any]:
     if not doc_id:
         return {"error": "missing_doc_id"}
@@ -3771,7 +4234,12 @@ async def kb_demote(ctx: Context, doc_id: str, weight: float = 0.2) -> Dict[str,
         "multiplier": multiplier,
     }
 
-@mcp.tool(name="kb.collections", title="KB: List Collections")
+@mcp.tool(name="kb.collections", title="KB: List Collections", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+})
 async def kb_collections(ctx: Context) -> Dict[str, Any]:
     """Return the configured collection slugs and their metadata."""
     entries = []
@@ -3783,20 +4251,44 @@ async def kb_collections(ctx: Context) -> Dict[str, Any]:
         })
     return {"collections": entries}
 
-@mcp.tool(name="kb.search", title="KB: Search")
-async def kb_search(
-    ctx: Context,
-    query: str,
-    collection: Optional[str] = None,
-    mode: str = "rerank",
-    top_k: int = 8,
-    retrieve_k: int = 24,
-    return_k: int = 8,
-    scope: Optional[Dict[str, Any]] = None,
-    response_profile: str = "slim",
-) -> List[Dict[str, Any]]:
-    """Vector search (semantic), rerank, hybrid, sparse, or auto planner."""
-    if not isinstance(query, str) or not query.strip():
+@mcp.tool(name="kb.search", title="KB: Search", annotations={
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+})
+async def kb_search(ctx: Context, params: KBSearchInput) -> List[Dict[str, Any]]:
+    """Vector search (semantic), rerank, hybrid, sparse, or auto planner.
+
+    This tool performs semantic, lexical, or hybrid search based on the specified mode.
+    It automatically routes queries to the optimal search strategy when mode="auto".
+
+    Args:
+        ctx: MCP context with session metadata
+        params: Search parameters (KBSearchInput) including:
+            - query (str): The search query text
+            - collection (Optional[str]): Target collection slug or name
+            - mode (str): Search mode (auto/semantic/rerank/hybrid/sparse/sparse_splade/colbert)
+            - retrieve_k (int): Number of candidates to retrieve (1-256)
+            - return_k (int): Number of results to return (1-256)
+            - top_k (int): Top-k for reranking stage (1-256)
+            - scope (Optional[Dict]): Filters and doc_id boosts
+            - response_profile (str): Detail level (slim/full/diagnostic)
+
+    Returns:
+        List[Dict[str, Any]]: Search results with scores, metadata, and timings
+    """
+    # Extract validated parameters from Pydantic model
+    query = params.query
+    collection = params.collection
+    mode = params.mode
+    top_k = params.top_k
+    retrieve_k = params.retrieve_k
+    return_k = params.return_k
+    scope = params.scope
+    response_profile = params.response_profile
+
+    if not query.strip():
         return [{"error": "empty_query"}]
     slug, collection_name, _ = _resolve_scope(collection)
     start_time = time.perf_counter()

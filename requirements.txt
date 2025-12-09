@@ -2,6 +2,7 @@ markitdown[all]
 docling
 qdrant-client
 requests
+httpx>=0.25.0
 numpy
 tqdm
 mcp[cli]

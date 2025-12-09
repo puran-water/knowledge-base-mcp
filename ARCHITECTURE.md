@@ -74,6 +74,20 @@ The Semantic Search MCP Server is a hybrid RAG (Retrieval-Augmented Generation) 
 - **Document Store**: Hydrates thin payloads and enforces ACLs before exposing text to clients
 - **Observability Hooks**: Outputs JSON logs with hashed subject IDs, stage timings, and result metadata
 
+**MCP Best Practices Implementation**:
+- **Tool Annotations**: All 31 tools include standardized MCP annotations:
+  - `readOnlyHint`: True for retrieval tools, False for ingestion/session tools
+  - `destructiveHint`: True for upsert operations that modify data
+  - `idempotentHint`: True for all tools (safe to retry)
+  - `openWorldHint`: True for search tools that access external data
+- **Pydantic Input Models**: `models.py` provides validated input schemas with:
+  - Field constraints (min/max length, numeric bounds)
+  - Clear error messages for invalid inputs
+  - `FlexibleModel` base class allowing extra fields for forward compatibility
+- **Pagination Metadata**: Search results include `count`, `retrieve_k`, `return_k`, `has_more`, `top_k`
+- **Comprehensive Docstrings**: Key tools include Args/Returns documentation
+- **Async HTTP Client**: Uses `httpx.AsyncClient` for embedding and reranker calls
+
 **Responsibilities**:
 - Handle MCP protocol communication
 - Manage multiple collection scopes
