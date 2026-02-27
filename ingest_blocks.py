@@ -225,28 +225,16 @@ def _extract_unit_from_header(header: str) -> Tuple[str, Optional[str]]:
     return header, None
 
 
-def _docling_full_document_to_blocks(
+def blocks_from_doc_dict(
+    doc_dict: dict,
     path: Path,
     doc_id: str,
 ) -> Tuple[List[Block], Dict[str, Any]]:
+    """Convert a Docling doc_dict into Block objects.
+
+    Enables remote extraction (Modal) to return doc_dict while
+    local code handles block construction and chunking.
     """
-    Process entire PDF with Docling in a single call.
-    Returns all blocks and metadata for the document.
-    """
-    # Detect if OCR is needed and get file size
-    file_size_mb = path.stat().st_size / (1024 * 1024)
-    needs_ocr = _check_pdf_needs_ocr(path)
-
-    converter = _get_docling_converter(needs_ocr=needs_ocr, file_size_mb=file_size_mb)
-
-    print(f"Converting full document with Docling: {path} ({file_size_mb:.1f}MB)")
-    try:
-        result = converter.convert(str(path))
-        doc_dict = result.document.export_to_dict()
-    except Exception as exc:
-        print(f"ERROR: Docling failed for {path}: {exc}")
-        return [], {"error": str(exc), "total_pages": 0}
-
     if not doc_dict:
         return [], {"error": "Empty doc_dict", "total_pages": 0}
 
@@ -469,6 +457,31 @@ def _docling_full_document_to_blocks(
     }
 
     return blocks, metadata
+
+
+def _docling_full_document_to_blocks(
+    path: Path,
+    doc_id: str,
+) -> Tuple[List[Block], Dict[str, Any]]:
+    """
+    Process entire PDF with Docling in a single call.
+    Returns all blocks and metadata for the document.
+    """
+    # Detect if OCR is needed and get file size
+    file_size_mb = path.stat().st_size / (1024 * 1024)
+    needs_ocr = _check_pdf_needs_ocr(path)
+
+    converter = _get_docling_converter(needs_ocr=needs_ocr, file_size_mb=file_size_mb)
+
+    print(f"Converting full document with Docling: {path} ({file_size_mb:.1f}MB)")
+    try:
+        result = converter.convert(str(path))
+        doc_dict = result.document.export_to_dict()
+    except Exception as exc:
+        print(f"ERROR: Docling failed for {path}: {exc}")
+        return [], {"error": str(exc), "total_pages": 0}
+
+    return blocks_from_doc_dict(doc_dict, path, doc_id)
 
 
 def _serialize_blocks(blocks: Iterable[Block]) -> List[Dict[str, Any]]:

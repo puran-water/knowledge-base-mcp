@@ -202,7 +202,7 @@ python3 -m venv .venv
 # Activate it
 source .venv/bin/activate  # macOS/Linux
 # OR
-.venv\Scripts\activate     # Windows
+# .venv\Scripts\activate   # Windows (legacy)
 ```
 
 Your prompt should now show `(.venv)` prefix.

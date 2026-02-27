@@ -14,7 +14,7 @@ For bulk ingestion (10+ documents, large PDFs, or production pipelines), recomme
 Use when rebuilding the collection from scratch or when major changes require complete reprocessing:
 
 ```bash
-.venv/bin/python3 ingest.py --root /path/to/documents --qdrant-collection my_collection --max-chars 700 --batch-size 128 --parallel 1 --ollama-threads 4 --fts-db data/my_collection_fts.db --fts-rebuild
+.venv/bin/python3 ingest.py --root /path/to/documents --qdrant-collection my_collection --max-chars 900 --batch-size 128 --parallel 1 --ollama-threads 4 --fts-db data/my_collection_fts.db --fts-rebuild
 ```
 
 **What this does:**
@@ -26,12 +26,12 @@ Use when rebuilding the collection from scratch or when major changes require co
 Use for daily/weekly updates to add new documents and update changed ones WITHOUT reprocessing everything:
 
 ```bash
-.venv/bin/python3 ingest.py --root /path/to/documents --qdrant-collection my_collection --max-chars 700 --batch-size 128 --parallel 1 --ollama-threads 4 --fts-db data/my_collection_fts.db --changed-only --delete-changed
+.venv/bin/python3 ingest.py --root /path/to/documents --qdrant-collection my_collection --max-chars 900 --batch-size 128 --parallel 1 --ollama-threads 4 --fts-db data/my_collection_fts.db --changed-only --delete-changed
 ```
 
 **What this does:**
-- Computes SHA256 hash of each document's extracted text
-- Compares with existing chunks in Qdrant
+- **Fast-path skip**: Compares `mtime_ns` + `file_size` via quick `stat()` call BEFORE extraction (~1ms vs ~2-5s per unchanged file)
+- Falls back to SHA256 `content_hash` comparison for edge cases where mtime changed but content didn't
 - **Only processes documents that are new or have changed content**
 - Deletes old chunks before reinserting changed documents (`--delete-changed`)
 - Skips unchanged documents entirely (massive time savings)
@@ -44,9 +44,59 @@ Use for daily/weekly updates to add new documents and update changed ones WITHOU
 - `--fts-db` MUST match collection name (e.g., `data/my_collection_fts.db` for `--qdrant-collection my_collection`) or data goes to wrong database
 - `--max-file-mb` controls file size limit (default: 64MB). **Always check file sizes and increase to 100-200 for large handbooks** - files exceeding limit are silently skipped without warning
 - `--batch-size 128` for better embedding throughput (new default vs old 32)
-- `--max-chars 700` recommended for reranker compatibility (old default: 1800)
+- `--max-chars 900` recommended for reranker+embedding balance (default, matched to `RERANK_MAX_CHARS=900`)
 - `--parallel 1` for single-threaded ingestion (safer for large PDFs)
 - `--ollama-threads 4` controls Ollama embedding parallelism
+- `--no-graph` skip graph building for faster bulk runs (can be backfilled later)
+- `--parallel-docs 2` parallel extraction+chunking (2 workers, ~500MB each; default: 2)
+- `--source-prefix /mnt/c/Users/hvksh --display-prefix "C:\Users\hvksh"` for Windows path translation (WSL2)
+
+#### Windows Path Translation
+When ingesting from WSL2-mounted Windows files, use `--source-prefix` and `--display-prefix` to store the original Windows path alongside the POSIX path:
+```bash
+.venv/bin/python3 ingest.py --root /mnt/c/Users/hvksh/Circle\ H2O\ LLC/ \
+  --source-prefix "/mnt/c/Users/hvksh" --display-prefix "C:\Users\hvksh" \
+  ...
+```
+This stores `source_path` (e.g., `C:\Users\hvksh\Circle H2O LLC\docs\file.pdf`) in both Qdrant payloads and FTS rows, surfaced in SLIM retrieval results.
+
+#### Parallel Ingestion
+For bulk runs with multiple CPU cores available:
+```bash
+.venv/bin/python3 ingest.py --root /path/to/docs --parallel-docs 2 --no-graph ...
+```
+- **Stage 1**: Parallel extract+chunk (ProcessPoolExecutor with `spawn` start method)
+- **Stage 2**: Centralized cross-document embedding (single Ollama consumer, large batches)
+- **Stage 3**: Sequential Qdrant + FTS + graph writes
+- Default `--parallel-docs 2`; use 1 for serial behavior (Docling ~500MB/worker)
+
+#### Cloud-Accelerated Ingestion (Modal)
+Modal app definitions live in `~/servers/rag-backend/modal_deploy.py` (separate workspace, analogous to `~/servers/oci-provision/`). Deploy with:
+```bash
+cd ~/servers/rag-backend && ./deploy.sh
+```
+
+Full cloud-accelerated ingestion (extraction + embedding):
+```bash
+.venv/bin/python3 ingest.py --root /path/to/docs \
+  --extract-provider modal --modal-extract-url <docling-url> \
+  --embed-provider tei --tei-embed-url <tei-url> \
+  --parallel-docs 8 --no-graph ...
+```
+- `--extract-provider modal` routes PDF extraction to Modal Docling (returns full `doc_dict`, not markdown)
+- `--modal-extract-url` specifies the Docling extraction endpoint
+- `--embed-provider tei` routes embedding to TEI HTTP endpoint instead of local Ollama
+- `--tei-embed-url` specifies the TEI `/embed` endpoint
+- `--parallel-docs 8` recommended for Modal (I/O-bound threads vs CPU-bound processes for local)
+- **Critical**: Query embedding model must match index embedding model. Set `TEI_EMBED_URL` env var for `server.py` when using TEI for ingestion.
+- `modal_services.py` in knowledge-base contains only HTTP client functions (no Modal SDK dependency)
+
+#### TEI Query Embedding
+When ingesting with `--embed-provider tei`, query-time embedding must use the same model:
+```bash
+TEI_EMBED_URL=<tei-url> python3 server.py stdio
+```
+When `TEI_EMBED_URL` is set, `embed_query()` routes to TEI instead of Ollama. When unset, Ollama is used (default).
 
 ### For Interactive MCP-Based Ingestion
 Use MCP tools for small-scale interactive work (1-10 documents):
@@ -101,8 +151,12 @@ All metadata preserved in both Qdrant vector payloads and FTS database.
 
 2. **Response profiles for token efficiency**
    - All retrieval tools support `response_profile` parameter (defaults to `"slim"`)
-   - **SLIM** (default): Essential fields only (chunk_id, text, doc_id, path, section_path, page_numbers, chunk_start, chunk_end, score, route)
-     - ~85% token reduction vs full metadata
+   - **SLIM** (default): Essential fields only (chunk_id, text, doc_id, path, filename, source_path, mtime, section_path, page_numbers, chunk_start, chunk_end, score, route)
+     - `mtime` formatted as ISO 8601 (e.g., `"2025-11-15T08:30:00Z"`) — use to favor recency when results conflict
+     - `source_path` shows Windows path (e.g., `"C:\Users\hvksh\Circle H2O LLC\docs\file.pdf"`) — use to direct users to files
+     - `filename` shows the file name (e.g., `"file.pdf"`)
+     - None-valued fields are omitted to save tokens
+     - ~80% token reduction vs full metadata
      - Sufficient for most retrieval + neighbor expansion workflows
      - Use for standard Q&A, context retrieval, and neighbor sorting
    - **FULL**: Adds structural metadata (element_ids, bboxes, types, table_headers, table_units, source_tools)
@@ -127,13 +181,20 @@ All metadata preserved in both Qdrant vector payloads and FTS database.
    - Re-run with `kb.dense(query=hypothesis, retrieve_k=..., return_k=...)` and compare telemetry
    - Adopt if improves recall while meeting answerability gates; otherwise revert or abstain
 
-5. **Session priors**
+5. **Recency decay** (active by default)
+   - Documents are scored with a recency decay factor: `DECAY_HALF_LIFE_DAYS=180`, `DECAY_STRENGTH=0.15`
+   - Documents >6 months old get ~50% decay weight; >1 year ~25%
+   - Even very old docs retain 85% minimum score — gently favors newer info without burying authoritative material
+   - Override via env vars `DECAY_HALF_LIFE_DAYS=0` to disable, or adjust strength/half-life
+   - Use `mtime` in SLIM results (ISO 8601) to explain recency preferences to users
+
+6. **Session priors**
    - `kb.promote` / `kb.demote` once you've verified document quality in this session
 
 ## Best Practices for Context Retrieval with kb.neighbors
 
 ### Why You Must Expand Every Search Result
-With the recommended chunk size of 700 characters (optimized for reranker compatibility), **complete context is distributed across neighboring chunks**. A single chunk rarely contains the full information needed to answer a query comprehensively.
+With the recommended chunk size of 900 characters (optimized for reranker+embedding balance), **complete context is distributed across neighboring chunks**. A single chunk rarely contains the full information needed to answer a query comprehensively.
 
 **CRITICAL WORKFLOW - Apply to ALL searches**:
 1. Use `kb.search` or `kb.hybrid` to locate the **most relevant chunk(s)**
@@ -142,7 +203,7 @@ With the recommended chunk size of 700 characters (optimized for reranker compat
 
 **Default neighbor radius**: `n=10` (retrieves 10 chunks before and after the reference chunk)
 
-### What Gets Distributed Across Neighbors at Chunk Size 700
+### What Gets Distributed Across Neighbors at Chunk Size 900
 - **Tables**: Data rows typically 3-10 chunks away from table captions/headers
 - **Procedures**: Multi-step instructions split across multiple chunks
 - **Definitions**: Term definition separated from usage examples
@@ -207,7 +268,7 @@ Reducing below n=10 risks incomplete answers.
 
 ### Best Practice Summary
 ✅ **ALWAYS expand top search results with kb_neighbors(n=10)** - treat this as mandatory, not optional
-✅ **Single chunks are insufficient** - 700-char chunks distribute context across neighbors
+✅ **Single chunks are insufficient** - 900-char chunks distribute context across neighbors
 ✅ Use the reference chunk's `chunk_id` from search results as the anchor
 ✅ Expect critical information to be 3-10 chunks away from the highest-scoring chunk
 ✅ Parse neighbor results by chunk_start position (ascending order) for coherent context

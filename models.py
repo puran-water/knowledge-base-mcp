@@ -113,7 +113,7 @@ class IngestChunkInput(StrictModel):
         description="Chunking profile: auto, heading_based, procedure_block, table_row, fixed_window",
     )
     max_chars: int = Field(
-        default=1800,
+        default=900,
         description="Maximum characters per chunk",
         ge=100,
         le=10000,
@@ -303,7 +303,7 @@ class IngestCorpusUpsertInput(StrictModel):
         description="Extraction method (auto uses Docling for all)",
     )
     chunk_profile: str = Field(default="auto")
-    max_chars: int = Field(default=1800, ge=100, le=10000)
+    max_chars: int = Field(default=900, ge=100, le=10000)
     overlap_sentences: int = Field(default=1, ge=0, le=10)
     skip_vectors: bool = Field(default=False)
     update_graph: bool = Field(default=True)

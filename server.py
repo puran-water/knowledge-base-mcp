@@ -106,6 +106,7 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "snowflake-arctic-embed:xs")
 OLLAMA_LLM = os.getenv("OLLAMA_LLM", os.getenv("OLLAMA_MODEL_GENERATE", "llama3:8b"))
 TEI_RERANK_URL = os.getenv("TEI_RERANK_URL", "http://localhost:8087")
+TEI_EMBED_URL = os.getenv("TEI_EMBED_URL", "")  # Empty = use Ollama (default)
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_METRIC = os.getenv("QDRANT_METRIC", "cosine")
@@ -187,14 +188,14 @@ def _lookup_chunk_by_element(element_id: str, fts_db_path: Optional[str] = None)
             pass
 
 # Rerank constraints to avoid payload-too-large
-RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "700"))
+RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "900"))
 RERANK_MAX_ITEMS = int(os.getenv("RERANK_MAX_ITEMS", "16"))
 HYBRID_RRF_K = int(os.getenv("HYBRID_RRF_K", "60"))
 # Neighbor packaging and scoring controls
 NEIGHBOR_CHUNKS = int(os.getenv("NEIGHBOR_CHUNKS", "1"))
 ANSWERABILITY_THRESHOLD = float(os.getenv("ANSWERABILITY_THRESHOLD", "0.0"))
-DECAY_HALF_LIFE_DAYS = float(os.getenv("DECAY_HALF_LIFE_DAYS", "0"))
-DECAY_STRENGTH = float(os.getenv("DECAY_STRENGTH", "0.0"))
+DECAY_HALF_LIFE_DAYS = float(os.getenv("DECAY_HALF_LIFE_DAYS", "180"))
+DECAY_STRENGTH = float(os.getenv("DECAY_STRENGTH", "0.15"))
 MIX_W_BM25 = _env_float("MIX_W_BM25", 0.2)
 MIX_W_DENSE = _env_float("MIX_W_DENSE", 0.3)
 MIX_W_RERANK = _env_float("MIX_W_RERANK", 0.5)
@@ -240,17 +241,34 @@ def _summarize(values: List[float]) -> Optional[Dict[str, float]]:
 
 
 async def embed_query(text: str, normalize: bool = True) -> List[float]:
-    """Generate embedding vector for query text using Ollama.
+    """Generate embedding vector for query text.
 
-    Uses native async httpx for non-blocking HTTP calls.
-
-    Args:
-        text: Query text to embed
-        normalize: Whether to L2-normalize the vector (default: True)
-
-    Returns:
-        List[float]: Embedding vector
+    Routes to TEI if TEI_EMBED_URL is set, otherwise uses Ollama.
     """
+    if TEI_EMBED_URL:
+        return await _embed_query_tei(text, normalize)
+    return await _embed_query_ollama(text, normalize)
+
+
+async def _embed_query_tei(text: str, normalize: bool = True) -> List[float]:
+    """Embed via TEI /embed endpoint."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                f"{TEI_EMBED_URL.rstrip('/')}/embed",
+                json={"inputs": [text]},
+            )
+            r.raise_for_status()
+            vecs = r.json()
+            v = vecs[0] if vecs else []
+        return l2norm(v) if normalize else v
+    except Exception:
+        logger.exception("embed_query (TEI) failed")
+        raise
+
+
+async def _embed_query_ollama(text: str, normalize: bool = True) -> List[float]:
+    """Generate embedding vector for query text using Ollama."""
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(
@@ -398,6 +416,9 @@ async def _run_colbert(
             "chunk_id": chunk_id,
             "doc_id": base.get("doc_id"),
             "path": base.get("path"),
+            "filename": base.get("filename"),
+            "source_path": base.get("source_path"),
+            "mtime": base.get("mtime"),
             "chunk_start": base.get("chunk_start"),
             "chunk_end": base.get("chunk_end"),
             "text": base.get("text"),
@@ -1207,7 +1228,7 @@ async def ingest_validate_extraction(
     "idempotentHint": True,
     "openWorldHint": False,
 })
-async def ingest_chunk(ctx: Context, artifacts_ref: str, profile: str = "auto", max_chars: int = 1800, overlap_sentences: int = 1) -> Dict[str, Any]:
+async def ingest_chunk(ctx: Context, artifacts_ref: str, profile: str = "auto", max_chars: int = 900, overlap_sentences: int = 1) -> Dict[str, Any]:
     """Chunk extracted blocks into retrieval-sized pieces.
 
     Splits document blocks into chunks suitable for embedding and retrieval.
@@ -1217,7 +1238,7 @@ async def ingest_chunk(ctx: Context, artifacts_ref: str, profile: str = "auto", 
         ctx: MCP context with session metadata
         artifacts_ref: Path to blocks artifact from extraction
         profile: Chunking strategy - auto/fixed_window/heading_based/procedure_block/table_row
-        max_chars: Maximum characters per chunk (default 1800, recommend 700 for reranker)
+        max_chars: Maximum characters per chunk (default 900, optimized for reranker+embedding balance)
         overlap_sentences: Sentence overlap between chunks (default 1)
 
     Returns:
@@ -1835,7 +1856,7 @@ async def ingest_corpus_upsert(
     collection: Optional[str] = None,
     extractor: str = "auto",
     chunk_profile: str = "auto",
-    max_chars: int = 1800,
+    max_chars: int = 900,
     overlap_sentences: int = 1,
     dry_run: bool = False,
     thin_payload: Optional[bool] = None,
@@ -2202,12 +2223,25 @@ def prune_row(row: Dict[str, Any], profile: ResponseProfile = ResponseProfile.SL
         return row
 
     if profile == ResponseProfile.SLIM:
+        # Format mtime as ISO 8601 for human/LLM readability
+        mtime_raw = row.get("mtime")
+        mtime_iso = None
+        if mtime_raw and isinstance(mtime_raw, (int, float)) and float(mtime_raw) > 0:
+            from datetime import datetime as _dt, timezone as _tz
+            try:
+                mtime_iso = _dt.fromtimestamp(float(mtime_raw), tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except (OSError, ValueError):
+                pass
+
         # Essential fields for citations + context + neighbor sorting
-        return {
+        out = {
             "chunk_id": row.get("chunk_id"),
             "text": row.get("text"),
             "doc_id": row.get("doc_id"),
             "path": row.get("path"),
+            "filename": row.get("filename"),
+            "source_path": row.get("source_path"),
+            "mtime": mtime_iso,
             "section_path": row.get("section_path", []),
             "page_numbers": row.get("page_numbers", []),
             "chunk_start": row.get("chunk_start"),  # Required for neighbor sorting
@@ -2215,13 +2249,14 @@ def prune_row(row: Dict[str, Any], profile: ResponseProfile = ResponseProfile.SL
             "score": row.get("final_score") or row.get("score", 0.0),
             "route": row.get("route"),
         }
+        return {k: v for k, v in out.items() if v is not None}
 
     if profile == ResponseProfile.FULL:
         # Keep structural metadata, drop provenance
         keep_fields = {
             "chunk_id", "text", "doc_id", "path",
             "chunk_start", "chunk_end", "section_path",
-            "pages", "page_numbers", "filename",
+            "pages", "page_numbers", "filename", "source_path", "mtime",
             "score", "final_score", "route",
             "element_ids", "bboxes", "types",
             "table_headers", "table_units", "source_tools"
@@ -2340,13 +2375,14 @@ async def _run_semantic(
     limit = max(top_k, return_k)
     try:
         start = time.perf_counter()
-        hits = await asyncio.to_thread(
-            qdr.search,
+        resp = await asyncio.to_thread(
+            qdr.query_points,
             collection_name=collection,
-            query_vector=query_vec,
+            query=query_vec,
             limit=limit,
             with_payload=True,
         )
+        hits = resp.points
         timings["qdrant_ms"] = timings.get("qdrant_ms", 0.0) + (time.perf_counter() - start) * 1000.0
     except Exception as exc:
         return [{"error": "qdrant_search_failed", "detail": str(exc)}]
@@ -2358,7 +2394,7 @@ async def _run_semantic(
         dense_score = getattr(h, "score", 0.0)
         decay = _decay_factor(pl.get("mtime"))
         prior_mult = _prior_multiplier(pl.get("doc_id"), subjects, boosts)
-        final_score = dense_score * prior_mult
+        final_score = dense_score * prior_mult * decay
         row = {
             "score": final_score,
             "final_score": final_score,
@@ -2368,6 +2404,9 @@ async def _run_semantic(
             "chunk_id": str(getattr(h, "id", "")),
             "doc_id": pl.get("doc_id"),
             "path": pl.get("path"),
+            "filename": pl.get("filename"),
+            "source_path": pl.get("source_path"),
+            "mtime": pl.get("mtime"),
             "chunk_start": pl.get("chunk_start"),
             "chunk_end": pl.get("chunk_end"),
             "text": pl.get("text"),
@@ -2441,6 +2480,9 @@ async def _run_sparse(
             "chunk_id": item.get("chunk_id"),
             "doc_id": item.get("doc_id"),
             "path": item.get("path"),
+            "filename": item.get("filename"),
+            "source_path": item.get("source_path"),
+            "mtime": item.get("mtime"),
             "chunk_start": item.get("chunk_start"),
             "chunk_end": item.get("chunk_end"),
             "text": item.get("text"),
@@ -2522,6 +2564,9 @@ async def _run_sparse_splade(
             "chunk_id": item.get("chunk_id"),
             "doc_id": item.get("doc_id"),
             "path": item.get("path"),
+            "filename": item.get("filename"),
+            "source_path": item.get("source_path"),
+            "mtime": item.get("mtime"),
             "chunk_start": item.get("chunk_start"),
             "chunk_end": item.get("chunk_end"),
             "text": item.get("text"),
@@ -2567,13 +2612,14 @@ async def _run_rerank(
     limit = min(retrieve_k, RERANK_MAX_ITEMS)
     try:
         start = time.perf_counter()
-        hits = await asyncio.to_thread(
-            qdr.search,
+        resp = await asyncio.to_thread(
+            qdr.query_points,
             collection_name=collection,
-            query_vector=query_vec,
+            query=query_vec,
             limit=limit,
             with_payload=True,
         )
+        hits = resp.points
         timings["qdrant_ms"] = timings.get("qdrant_ms", 0.0) + (time.perf_counter() - start) * 1000.0
     except Exception as exc:
         return [{"error": "qdrant_search_failed", "detail": str(exc)}]
@@ -2603,15 +2649,20 @@ async def _run_rerank(
             pl = h.payload or {}
             dense_val = getattr(h, "score", 0.0)
             decay = _decay_factor(pl.get("mtime"))
+            prior_mult = _prior_multiplier(pl.get("doc_id"), subjects, boosts)
+            fallback_final = dense_val * prior_mult * decay
             fallback_rows.append({
-                "score": dense_val,
-                "final_score": dense_val,
+                "score": fallback_final,
+                "final_score": fallback_final,
                 "dense_score": dense_val,
                 "decay_factor": decay,
                 "id": str(getattr(h, "id", "")),
                 "chunk_id": str(getattr(h, "id", "")),
                 "doc_id": pl.get("doc_id"),
                 "path": pl.get("path"),
+                "filename": pl.get("filename"),
+                "source_path": pl.get("source_path"),
+                "mtime": pl.get("mtime"),
                 "chunk_start": pl.get("chunk_start"),
                 "chunk_end": pl.get("chunk_end"),
                 "text": pl.get("text"),
@@ -2687,6 +2738,9 @@ async def _run_rerank(
             "chunk_id": str(getattr(hit, "id", "")),
             "doc_id": payload.get("doc_id"),
             "path": payload.get("path"),
+            "filename": payload.get("filename"),
+            "source_path": payload.get("source_path"),
+            "mtime": payload.get("mtime"),
             "chunk_start": payload.get("chunk_start"),
             "chunk_end": payload.get("chunk_end"),
             "text": payload.get("text"),
@@ -2743,13 +2797,14 @@ async def _run_hybrid(
     limit = min(retrieve_k, RERANK_MAX_ITEMS)
     try:
         start = time.perf_counter()
-        dense_hits = await asyncio.to_thread(
-            qdr.search,
+        resp = await asyncio.to_thread(
+            qdr.query_points,
             collection_name=collection,
-            query_vector=query_vec,
+            query=query_vec,
             limit=limit,
             with_payload=True,
         )
+        dense_hits = resp.points
         timings["qdrant_ms"] = timings.get("qdrant_ms", 0.0) + (time.perf_counter() - start) * 1000.0
     except Exception as exc:
         return [{"error": "qdrant_search_failed", "detail": str(exc)}]
@@ -2769,6 +2824,7 @@ async def _run_hybrid(
             "doc_id": payload.get("doc_id"),
             "path": payload.get("path"),
             "filename": payload.get("filename"),
+            "source_path": payload.get("source_path"),
             "chunk_start": payload.get("chunk_start"),
             "chunk_end": payload.get("chunk_end"),
             "mtime": payload.get("mtime"),
@@ -2815,7 +2871,7 @@ async def _run_hybrid(
             if prior_mult is None:
                 prior_mult = _prior_multiplier(x.get("doc_id"), subjects, boosts)
             base_rrf = x.get("_rrf_score") or 0.0
-            final = base_rrf * prior_mult
+            final = base_rrf * prior_mult * decay
             fallback_rows.append({
                 "score": final,
                 "final_score": final,
@@ -2827,6 +2883,9 @@ async def _run_hybrid(
                 "chunk_id": x.get("chunk_id"),
                 "doc_id": x.get("doc_id"),
                 "path": x.get("path"),
+                "filename": x.get("filename"),
+                "source_path": x.get("source_path"),
+                "mtime": x.get("mtime"),
                 "chunk_start": x.get("chunk_start"),
                 "chunk_end": x.get("chunk_end"),
                 "text": x.get("text"),
@@ -2907,6 +2966,9 @@ async def _run_hybrid(
             "chunk_id": x.get("chunk_id"),
             "doc_id": x.get("doc_id"),
             "path": x.get("path"),
+            "filename": x.get("filename"),
+            "source_path": x.get("source_path"),
+            "mtime": x.get("mtime"),
             "chunk_start": x.get("chunk_start"),
             "chunk_end": x.get("chunk_end"),
             "text": x.get("text"),
@@ -3953,7 +4015,7 @@ async def kb_neighbors(
     from the same document, sorted by chunk_start position. Essential for
     reconstructing context around search results.
 
-    CRITICAL: With 700-char chunks, use n=10 (21 chunks total) to capture
+    CRITICAL: With 900-char chunks, use n=10 (21 chunks total) to capture
     complete tables, procedures, or multi-paragraph context. Never rely on
     a single chunk alone.
 
@@ -4021,6 +4083,9 @@ async def kb_neighbors(
             "chunk_id": raw.get("chunk_id"),
             "doc_id": raw.get("doc_id"),
             "path": raw.get("path"),
+            "filename": raw.get("filename"),
+            "source_path": raw.get("source_path"),
+            "mtime": raw.get("mtime"),
             "chunk_start": raw.get("chunk_start"),
             "chunk_end": raw.get("chunk_end"),
             "text": raw.get("text"),

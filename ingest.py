@@ -46,6 +46,7 @@ from ingest_core import (
     ensure_qdrant_collection,
     get_qdrant_client,
     qdrant_any_by_filter,
+    qdrant_batch_doc_metadata,
     qdrant_delete_by_doc_id,
     upsert_qdrant,
 )
@@ -70,6 +71,16 @@ PLAN_DIR = pathlib.Path(os.getenv("INGEST_PLAN_DIR", "data/ingest_plans"))
 
 def file_uri(p: pathlib.Path) -> str:
     return p.resolve().as_uri()
+
+
+def translate_path(posix_path: str, source_prefix: str, display_prefix: str) -> Optional[str]:
+    """Convert '/mnt/c/Users/hvksh/docs/file.pdf' → 'C:\\Users\\hvksh\\docs\\file.pdf'"""
+    if not source_prefix or not display_prefix:
+        return None
+    if posix_path.startswith(source_prefix):
+        remainder = posix_path[len(source_prefix):]
+        return display_prefix.rstrip("\\") + remainder.replace("/", "\\")
+    return None
 
 
 def load_ingest_plan(doc_id: str) -> Optional[Dict[str, Any]]:
@@ -135,14 +146,18 @@ def compute_plan_hash(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
-def get_embedding_dim(ollama_url: str, model: str) -> int:
+def get_embedding_dim(ollama_url: str, model: str, embed_provider: str = "ollama", tei_url: str = "") -> int:
     try:
-        vecs = embed_texts(ollama_url, model, ["probe"], batch_size=1, normalize=False)
+        if embed_provider == "tei" and tei_url:
+            from modal_services import embed_texts_tei
+            vecs = embed_texts_tei(tei_url, ["probe"], batch_size=1, normalize=False)
+        else:
+            vecs = embed_texts(ollama_url, model, ["probe"], batch_size=1, normalize=False)
         if not vecs:
             raise RuntimeError("empty embedding response")
         return len(vecs[0])
     except Exception as exc:
-        raise SystemExit(f"Failed to probe Ollama at {ollama_url} for model {model}: {exc}")
+        raise SystemExit(f"Failed to probe embedding provider ({embed_provider}): {exc}")
 
 
 def select_chunk_profile(blocks: List[Any]) -> str:
@@ -306,7 +321,7 @@ def main():
     ap.add_argument("--metric", choices=["cosine", "dot", "euclid"], default="cosine")
 
     # Chunking
-    ap.add_argument("--max-chars", type=int, default=1800)
+    ap.add_argument("--max-chars", type=int, default=900)
     ap.add_argument("--overlap", type=int, default=150)
 
     # Embedding batch (increased default to 128 for better throughput)
@@ -350,7 +365,29 @@ def main():
     ap.add_argument("--changed-only", action="store_true", help="Only (re)ingest when content_hash differs; requires Qdrant store")
     ap.add_argument("--delete-changed", action="store_true", help="Delete existing chunks for a doc_id before reingesting when changed")
 
+    # Graph
+    ap.add_argument("--no-graph", action="store_true", help="Skip graph building (faster bulk runs)")
+
+    # Windows path translation
+    ap.add_argument("--source-prefix", default="", help="WSL mount prefix to strip (e.g., /mnt/c/Users/hvksh)")
+    ap.add_argument("--display-prefix", default="", help="Windows prefix to replace with (e.g., C:\\Users\\hvksh)")
+
+    # Parallel extraction
+    ap.add_argument("--parallel-docs", type=int, default=2, help="Number of documents to extract/chunk concurrently (default: 2; use 1 for serial)")
+
+    # Modal / TEI cloud providers (Step 9)
+    ap.add_argument("--extract-provider", choices=["local", "modal"], default="local", help="Extraction provider: local (Docling) or modal (cloud)")
+    ap.add_argument("--modal-extract-url", default="", help="Modal Docling extraction endpoint URL")
+    ap.add_argument("--embed-provider", choices=["ollama", "tei"], default="ollama", help="Embedding provider: ollama (local) or tei (TEI endpoint)")
+    ap.add_argument("--tei-embed-url", default="", help="TEI embedding endpoint URL (for --embed-provider tei)")
+
     args = ap.parse_args()
+
+    # Validate cloud provider args
+    if args.extract_provider == "modal" and not args.modal_extract_url:
+        raise SystemExit("--modal-extract-url is required when --extract-provider is 'modal'")
+    if args.embed_provider == "tei" and not args.tei_embed_url:
+        raise SystemExit("--tei-embed-url is required when --embed-provider is 'tei'")
 
     if not args.thin_payload:
         raw_thin = os.getenv("THIN_PAYLOAD")
@@ -380,7 +417,7 @@ def main():
     # Initialize Qdrant collection if we are doing vector ingest
     qdrant_client = get_qdrant_client(args.qdrant_url, args.qdrant_api_key, timeout=args.qdrant_timeout)
     if not args.fts_only:
-        embedding_dim = get_embedding_dim(args.ollama_url, args.ollama_model)
+        embedding_dim = get_embedding_dim(args.ollama_url, args.ollama_model, args.embed_provider, args.tei_embed_url)
         ensure_qdrant_collection(qdrant_client, args.qdrant_collection, embedding_dim, args.metric)
 
     files = []
@@ -414,6 +451,34 @@ def main():
 
     if not files:
         print("No files found to ingest.")
+        return
+
+    # Fast-path incremental skip: compare mtime_ns + file_size via stat()
+    # before extraction. Skips unchanged files in ~1ms instead of ~2-5s.
+    if args.changed_only and not args.fts_only:
+        all_doc_ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, file_uri(p))) for p in files]
+        print(f"Incremental: pre-fetching metadata for {len(all_doc_ids)} doc_ids...")
+        existing_meta = qdrant_batch_doc_metadata(qdrant_client, args.qdrant_collection, all_doc_ids)
+
+        unchanged = 0
+        changed_files = []
+        for p, doc_id in zip(files, all_doc_ids):
+            try:
+                stat = p.stat()
+            except OSError:
+                changed_files.append(p)
+                continue
+            meta = existing_meta.get(doc_id)
+            if meta and meta.get("mtime_ns") == stat.st_mtime_ns and meta.get("file_size") == stat.st_size:
+                unchanged += 1
+                continue
+            changed_files.append(p)
+
+        print(f"Incremental: {unchanged} unchanged (skipped), {len(changed_files)} to process")
+        files = changed_files
+
+    if not files:
+        print("No changed files to process.")
         return
 
     processed_docs = 0
@@ -455,242 +520,432 @@ def main():
             print(f"WARN: Failed to initialize FTS writer: {fex}")
             fts_writer = None
 
-    try:
-        for p in tqdm(files, desc="Ingesting"):
+    # ---- Helper: process one document result through graph/sparse/summary/embed/upsert ----
+    def _finalize_and_upsert(
+        p, doc_id, path_str, chunks, content_hash, mtime, file_size, mtime_ns,
+        source_path, chunk_profile, doc_metadata, metadata_rejects,
+        existing_plan, triage_info,
+    ):
+        """Run graph/sparse/summary, embed, upsert Qdrant+FTS for one document.
+        Returns (upserted_vecs, chunk_ids) or raises on failure."""
+        nonlocal processed_docs, processed_chunks, fts_buffer, fts_doc_ids
+
+        overlap_sentences = max(1, args.overlap // 80 if args.overlap else 1)
+        plan_payload = {
+            "doc_id": doc_id,
+            "path": path_str,
+            "collection": args.qdrant_collection,
+            "content_hash": content_hash,
+            "chunk_profile": chunk_profile,
+            "chunk_params": {
+                "max_chars": args.max_chars,
+                "overlap_sentences": overlap_sentences,
+            },
+            "triage": sanitize_triage_for_plan(triage_info) if isinstance(triage_info, dict) else {},
+            "model_version": INGEST_MODEL_VERSION,
+            "prompt_sha": INGEST_PROMPT_SHA,
+        }
+        if existing_plan and isinstance(existing_plan, dict) and isinstance(existing_plan.get("client_orchestration"), dict):
+            plan_payload["client_orchestration"] = existing_plan["client_orchestration"]
+
+        metadata_bytes = len(json.dumps(doc_metadata, ensure_ascii=False).encode("utf-8")) if doc_metadata else 0
+        if doc_metadata and metadata_bytes > MAX_METADATA_BYTES:
+            metadata_rejects.append(f"metadata_bytes_exceeded:{metadata_bytes}>{MAX_METADATA_BYTES}")
+            print(f"WARN: metadata exceeds MAX_METADATA_BYTES for {p} ({metadata_bytes} bytes)")
+            doc_metadata = {}
+        if doc_metadata:
+            plan_payload["doc_metadata"] = doc_metadata
+        if metadata_rejects:
+            plan_payload["metadata_rejects"] = metadata_rejects
+        plan_payload["metadata_calls"] = 1 if doc_metadata else 0
+        plan_hash = compute_plan_hash(plan_payload)
+        plan_payload["plan_hash"] = plan_hash
+        if not existing_plan or (isinstance(existing_plan, dict) and existing_plan.get("plan_hash") != plan_hash):
+            save_ingest_plan(doc_id, plan_payload)
+
+        # Graph
+        aggregated_entities = {}
+        if not args.no_graph:
             try:
-                # Use stable doc_id derived from file URI; store POSIX path for MCP tools
-                doc_id = str(uuid.uuid5(uuid.NAMESPACE_URL, file_uri(p)))
-                path_str = p.resolve().as_posix()
+                aggregated_entities = update_graph(args.qdrant_collection, doc_id, path_str, chunks)
+            except Exception as gex:
+                print(f"WARN: graph update failed for {p}: {gex}")
 
-                # Fast skip: if skipping existing docs, check before extraction
-                if args.skip_existing:
-                    if qdrant_any_by_filter(qdrant_client, args.qdrant_collection, [{"key": "doc_id", "value": doc_id}]):
-                        continue
+        if aggregated_entities:
+            doc_metadata["dynamic_entities"] = aggregated_entities
+            plan_payload["doc_metadata"] = doc_metadata
 
-                # Extract with Docling (content filtering moved to post-extraction)
-                # Start timing for extraction stage
-                import time as time_module
-                stage_start = time_module.time()
+        per_chunk_doc_metadata = {k: v for k, v in doc_metadata.items() if k != "dynamic_entities"} if doc_metadata else {}
+        for chunk in chunks:
+            chunk["plan_hash"] = plan_hash
+            if per_chunk_doc_metadata:
+                chunk["doc_metadata"] = dict(per_chunk_doc_metadata)
 
-                existing_plan = load_ingest_plan(doc_id)
-                plan_override = existing_plan.get("triage") if isinstance(existing_plan, dict) else None
-                triage_blocks, triage_info = extract_document_blocks(p, doc_id, plan_override=plan_override)
+        if sparse_expander:
+            for chunk in chunks:
+                terms = sparse_expander.encode(chunk.get("text", ""))
+                if terms:
+                    chunk["sparse_terms"] = [{"term": term, "weight": float(weight)} for term, weight in terms]
+                else:
+                    chunk["sparse_terms"] = []
 
-                # Surface tier and OCR info for visibility
-                tier_used = triage_info.get("tier", "UNKNOWN") if isinstance(triage_info, dict) else "UNKNOWN"
-                ocr_enabled = "ON" if (isinstance(triage_info, dict) and triage_info.get("ocr_enabled")) else "OFF"
-                tqdm.write(f"  [1/5] Extracting: {p.name} (tier: {tier_used}, OCR: {ocr_enabled})")
+        try:
+            upsert_summaries(args.qdrant_collection, doc_id, chunks)
+        except Exception as sex:
+            print(f"WARN: summary update failed for {p}: {sex}")
 
-                extraction_time = time_module.time() - stage_start
-                tqdm.write(f"  ✓ Extraction completed in {extraction_time:.1f}s")
+        # Incremental changed-only check (secondary guard — content_hash)
+        if args.changed_only and not args.fts_only:
+            same_hash = qdrant_any_by_filter(
+                qdrant_client, args.qdrant_collection,
+                [{"key": "doc_id", "value": doc_id}, {"key": "content_hash", "value": content_hash}],
+            )
+            if same_hash:
+                return 0, []
+            if args.delete_changed:
+                qdrant_delete_by_doc_id(qdrant_client, args.qdrant_collection, doc_id)
 
-                # Apply content filters after extraction
-                if not triage_blocks:
-                    continue
-                text = "\n\n".join(b.text for b in triage_blocks if b.text)
-                if not text.strip():
-                    continue
-                if args.min_words and alpha_word_count(text) < args.min_words:
-                    continue
-                overlap_sentences = max(1, args.overlap // 80 if args.overlap else 1)
-                if plan_override and isinstance(plan_override, dict):
-                    # Reuse overlap settings from existing plan if provided
-                    params = existing_plan.get("chunk_params") if isinstance(existing_plan, dict) else None
-                    if isinstance(params, dict):
-                        overlap_sentences = int(params.get("overlap_sentences", overlap_sentences) or overlap_sentences)
-                # Stage 2: Chunking with progress reporting
-                stage_start = time_module.time()
-                num_blocks = len(triage_blocks)
-                tqdm.write(f"  [2/5] Chunking: {num_blocks} blocks")
+        # Build IDs and payloads
+        ids: List[str] = []
+        payloads: List[Dict[str, Any]] = []
+        for chunk in chunks:
+            s = int(chunk.get("chunk_start", 0) or 0)
+            e = int(chunk.get("chunk_end", 0) or 0)
+            chunk_uuid = uuid.uuid5(uuid.UUID(doc_id), f"{s}-{e}")
+            ids.append(str(chunk_uuid))
+            payload = {
+                "doc_id": doc_id,
+                "path": path_str,
+                "chunk_start": s,
+                "chunk_end": e,
+                "filename": pathlib.Path(path_str).name,
+                "mtime": mtime,
+                "file_size": file_size,
+                "mtime_ns": mtime_ns,
+                "source_path": source_path,
+                "content_hash": content_hash,
+                "page_numbers": chunk.get("pages", []),
+                "section_path": chunk.get("section_path", []),
+                "element_ids": chunk.get("element_ids", []),
+                "bboxes": chunk.get("bboxes", []),
+                "types": chunk.get("types", []),
+                "source_tools": chunk.get("source_tools", []),
+                "table_headers": chunk.get("headers", []),
+                "table_units": chunk.get("units", []),
+                "chunk_profile": chunk.get("profile"),
+                "plan_hash": plan_hash,
+                "model_version": plan_payload.get("model_version"),
+                "prompt_sha": plan_payload.get("prompt_sha"),
+                "doc_metadata": chunk.get("doc_metadata", doc_metadata),
+                "text": chunk.get("text", ""),
+            }
+            if sparse_expander and chunk.get("sparse_terms"):
+                payload["sparse_terms"] = chunk.get("sparse_terms")
+            if args.thin_payload:
+                payload["thin_payload"] = True
+                payload.pop("text", None)
+            payloads.append(payload)
 
-                # Report progress dynamically based on total blocks (~5 updates)
-                report_interval = max(200, num_blocks // 20)
+        return ids, payloads
 
-                chunk_profile = (
-                    existing_plan.get("chunk_profile")
-                    if isinstance(existing_plan, dict) and existing_plan.get("chunk_profile")
-                    else select_chunk_profile(triage_blocks)
+    # ---- Helper: embed and upsert vectors to Qdrant ----
+    def _embed_and_upsert_qdrant(chunks, ids, payloads):
+        """Embed chunks and upsert to Qdrant. Returns number of vectors upserted."""
+        import time as time_module
+        upserted_vecs = 0
+        if args.fts_only:
+            return 0
+        if args.embed_robust:
+            n = len(chunks)
+            win = max(1, int(args.embed_window_size))
+            for start in range(0, n, win):
+                end = min(start + win, n)
+                subset = chunks[start:end]
+                texts_w = [c.get("text", "") for c in subset]
+                vecs_w = embed_texts_robust(
+                    args.ollama_url, args.ollama_model, texts_w,
+                    timeout=args.ollama_timeout,
+                    normalize=(args.metric == "cosine"),
+                    num_threads=args.ollama_threads,
+                    keep_alive=args.ollama_keepalive,
+                    max_retries=2,
                 )
-                chunks, raw_text = chunk_blocks(
-                    triage_blocks,
-                    args.max_chars,
-                    overlap_sentences=overlap_sentences,
-                    profile=chunk_profile,
+                ok_indices = [i for i, v in enumerate(vecs_w) if v is not None]
+                if ok_indices:
+                    sel_ids = [ids[start + i] for i in ok_indices]
+                    sel_payloads = [payloads[start + i] for i in ok_indices]
+                    sel_vecs = [vecs_w[i] for i in ok_indices]
+                    upsert_qdrant(qdrant_client, args.qdrant_collection, sel_vecs, sel_payloads, sel_ids)
+                    upserted_vecs += len(sel_ids)
+        else:
+            stage_start = time_module.time()
+            texts_to_embed = [c.get("text", "") for c in chunks]
+            if args.embed_provider == "tei" and args.tei_embed_url:
+                from modal_services import embed_texts_tei
+                vecs = embed_texts_tei(
+                    args.tei_embed_url, texts_to_embed,
+                    batch_size=args.batch_size,
+                    timeout=args.ollama_timeout,
+                    normalize=(args.metric == "cosine"),
                 )
+            else:
+                vecs = embed_texts(
+                    args.ollama_url, args.ollama_model,
+                    texts_to_embed,
+                    batch_size=args.batch_size,
+                    timeout=args.ollama_timeout,
+                    normalize=(args.metric == "cosine"),
+                    parallel=args.parallel,
+                    num_threads=args.ollama_threads,
+                    keep_alive=args.ollama_keepalive,
+                    force_per_item=args.ollama_per_item,
+                )
+            tqdm.write(f"  ✓ Embedding {len(chunks)} chunks in {time_module.time() - stage_start:.1f}s")
+            upsert_qdrant(qdrant_client, args.qdrant_collection, vecs, payloads, ids)
+            upserted_vecs = len(ids)
+        return upserted_vecs
 
-                # Report chunking progress (simplified - actual chunking is fast)
-                for i in range(0, num_blocks, report_interval):
-                    progress = min(i + report_interval, num_blocks)
-                    tqdm.write(f"    Chunked {progress}/{num_blocks} blocks")
+    # ---- Helper: build FTS rows for a document ----
+    def _build_fts_rows(doc_id, path_str, filename, source_path, mtime, chunks, ids, plan_payload, plan_hash):
+        rows = []
+        for i, chunk in enumerate(chunks):
+            s = int(chunk.get("chunk_start", 0) or 0)
+            e = int(chunk.get("chunk_end", 0) or 0)
+            t = chunk.get("text", "")
+            pages = chunk.get("pages", [])
+            section_path = chunk.get("section_path", [])
+            element_ids = chunk.get("element_ids", [])
+            bboxes = chunk.get("bboxes", [])
+            types = chunk.get("types", [])
+            source_tools = chunk.get("source_tools", [])
+            table_headers = chunk.get("headers", [])
+            table_units = chunk.get("units", [])
+            profile_tag = chunk.get("profile") or ""
+            doc_metadata_payload = chunk.get("doc_metadata") or {}
+            rows.append({
+                "text": t,
+                "chunk_id": ids[i],
+                "doc_id": doc_id,
+                "path": path_str,
+                "filename": filename,
+                "source_path": source_path or "",
+                "chunk_start": s,
+                "chunk_end": e,
+                "mtime": mtime,
+                "page_numbers": ",".join(str(n) for n in pages) if pages else "",
+                "pages": json.dumps(pages, ensure_ascii=False),
+                "section_path": json.dumps(section_path, ensure_ascii=False) if section_path else "",
+                "element_ids": json.dumps(element_ids, ensure_ascii=False) if element_ids else "",
+                "bboxes": json.dumps(bboxes, ensure_ascii=False) if bboxes else "",
+                "types": json.dumps(types, ensure_ascii=False) if types else "",
+                "source_tools": json.dumps(source_tools, ensure_ascii=False) if source_tools else "",
+                "table_headers": json.dumps(table_headers, ensure_ascii=False) if table_headers else "",
+                "table_units": json.dumps(table_units, ensure_ascii=False) if table_units else "",
+                "chunk_profile": profile_tag,
+                "plan_hash": plan_hash,
+                "model_version": plan_payload.get("model_version", ""),
+                "prompt_sha": plan_payload.get("prompt_sha", ""),
+                "doc_metadata": json.dumps(doc_metadata_payload, ensure_ascii=False) if doc_metadata_payload else "",
+                "sparse_terms": chunk.get("sparse_terms", []),
+            })
+        return rows
 
-                chunking_time = time_module.time() - stage_start
-                tqdm.write(f"  ✓ Chunking completed in {chunking_time:.1f}s")
-                if not raw_text.strip():
-                    raw_text = text
-                content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
-                mtime = int(p.stat().st_mtime)
+    # Deferred FTS batching (Step 7): accumulate rows and flush every ~50 docs
+    fts_buffer: List[Dict[str, Any]] = []
+    fts_doc_ids: set = set()
+    FTS_FLUSH_INTERVAL = 50
 
-                plan_payload = {
-                    "doc_id": doc_id,
-                    "path": path_str,
-                    "collection": args.qdrant_collection,
-                    "content_hash": content_hash,
-                    "chunk_profile": chunk_profile,
-                    "chunk_params": {
-                        "max_chars": args.max_chars,
-                        "overlap_sentences": overlap_sentences,
-                    },
-                    "triage": sanitize_triage_for_plan(triage_info),
-                    "model_version": INGEST_MODEL_VERSION,
-                    "prompt_sha": INGEST_PROMPT_SHA,
-                }
-                if existing_plan and isinstance(existing_plan.get("client_orchestration"), dict):
-                    plan_payload["client_orchestration"] = existing_plan["client_orchestration"]
-                # Stage 3: Metadata generation
-                stage_start = time_module.time()
-                tqdm.write(f"  [3/5] Generating metadata: {len(chunks)} chunks")
-                doc_metadata, metadata_rejects = generate_metadata(raw_text, chunks)
-                metadata_time = time_module.time() - stage_start
-                tqdm.write(f"  ✓ Metadata generation completed in {metadata_time:.1f}s")
-                metadata_bytes = len(json.dumps(doc_metadata, ensure_ascii=False).encode("utf-8")) if doc_metadata else 0
-                if doc_metadata and metadata_bytes > MAX_METADATA_BYTES:
-                    metadata_rejects.append(f"metadata_bytes_exceeded:{metadata_bytes}>{MAX_METADATA_BYTES}")
-                    print(f"WARN: metadata exceeds MAX_METADATA_BYTES for {p} ({metadata_bytes} bytes)")
-                    doc_metadata = {}
-                if doc_metadata:
-                    plan_payload["doc_metadata"] = doc_metadata
-                if metadata_rejects:
-                    plan_payload["metadata_rejects"] = metadata_rejects
-                    print(f"WARN: metadata validation issues for {p}: {metadata_rejects}")
-                plan_payload["metadata_calls"] = 1 if doc_metadata else 0
-                plan_hash = compute_plan_hash(plan_payload)
-                plan_payload["plan_hash"] = plan_hash
-                if not existing_plan or existing_plan.get("plan_hash") != plan_hash:
-                    save_ingest_plan(doc_id, plan_payload)
+    def _flush_fts():
+        nonlocal fts_buffer, fts_doc_ids
+        if not fts_buffer or fts_writer is None:
+            return
+        try:
+            for did in fts_doc_ids:
+                fts_writer.delete_doc(did, commit=False)
+            fts_writer.upsert_many(fts_buffer)
+            fts_writer.commit()
+        except Exception as fex:
+            print(f"WARN: FTS batch flush failed: {fex}")
+        fts_buffer, fts_doc_ids = [], set()
 
-                # Update graph and aggregate doc-level entities BEFORE assigning metadata to chunks
-                aggregated_entities = {}
-                try:
-                    aggregated_entities = update_graph(args.qdrant_collection, doc_id, path_str, chunks)
-                except Exception as gex:
-                    print(f"WARN: graph update failed for {p}: {gex}")
+    # ---- Parallel extraction path (--parallel-docs > 1) ----
+    use_parallel = args.parallel_docs > 1
 
-                # Store aggregated entities at document level only (not per-chunk) to avoid bloating payloads
-                # CRITICAL FIX: Create thin copy WITHOUT dynamic_entities for chunks
-                # Before fix: 67KB × 1321 chunks = 88MB (caused 30-min timeout due to shared dict reference)
-                # After fix: ~500B × 1321 chunks = ~660KB for chunk metadata, 67KB in plan_payload only
-                if aggregated_entities:
-                    # Store in document-level metadata (persisted in plan artifacts)
-                    doc_metadata["dynamic_entities"] = aggregated_entities
-                    plan_payload["doc_metadata"] = doc_metadata
+    try:
+        if use_parallel:
+            # Stage-split pipeline: parallel extract+chunk, centralized embed, sequential write
 
-                # Create lightweight copy for chunks WITHOUT dynamic_entities
-                per_chunk_doc_metadata = {k: v for k, v in doc_metadata.items() if k != "dynamic_entities"} if doc_metadata else {}
+            # Pre-filter for --skip-existing in parallel mode
+            if args.skip_existing:
+                pre_filter_ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, file_uri(p))) for p in files]
+                existing_set = set()
+                for did in pre_filter_ids:
+                    if qdrant_any_by_filter(qdrant_client, args.qdrant_collection, [{"key": "doc_id", "value": did}]):
+                        existing_set.add(did)
+                if existing_set:
+                    orig_len = len(files)
+                    files = [p for p, did in zip(files, pre_filter_ids) if did not in existing_set]
+                    print(f"Skip-existing: {orig_len - len(files)} already ingested, {len(files)} remaining")
 
-                # Assign plan_hash and thin metadata to each chunk
-                for chunk in chunks:
-                    chunk["plan_hash"] = plan_hash
-                    if per_chunk_doc_metadata:
-                        # Each chunk gets its own copy of the lightweight metadata (~500B)
-                        chunk["doc_metadata"] = dict(per_chunk_doc_metadata)
+            # Stage 1: Parallel extract + chunk
+            extracted = []
 
-                if sparse_expander:
-                    for chunk in chunks:
-                        terms = sparse_expander.encode(chunk.get("text", ""))
-                        if terms:
-                            chunk["sparse_terms"] = [{"term": term, "weight": float(weight)} for term, weight in terms]
-                        else:
-                            chunk["sparse_terms"] = []
-                try:
-                    upsert_summaries(args.qdrant_collection, doc_id, chunks)
-                except Exception as sex:
-                    print(f"WARN: summary update failed for {p}: {sex}")
+            if args.extract_provider == "modal" and args.modal_extract_url:
+                # Modal: I/O-bound HTTP uploads, use ThreadPool
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                from modal_services import extract_via_modal
+                from ingest_blocks import blocks_from_doc_dict, chunk_blocks as _chunk_blocks
+                from ingest_worker import translate_path as _translate_path
 
-                # Incremental changed-only check before doing embeddings
-                if args.changed_only and not args.fts_only:
-                    same_hash = qdrant_any_by_filter(
-                        qdrant_client,
-                        args.qdrant_collection,
-                        [{"key": "doc_id", "value": doc_id}, {"key": "content_hash", "value": content_hash}],
+                print(f"Parallel mode: {args.parallel_docs} threads (Modal extraction)")
+
+                def _modal_extract_and_chunk(file_path_str):
+                    """Extract via Modal HTTP, chunk locally."""
+                    p = pathlib.Path(file_path_str)
+                    doc_id = str(uuid.uuid5(uuid.NAMESPACE_URL, file_uri(p)))
+                    path_str = str(p.resolve())
+                    stat = p.stat()
+
+                    try:
+                        modal_result = extract_via_modal(file_path_str, args.modal_extract_url)
+                    except Exception as exc:
+                        return {"doc_id": doc_id, "error": str(exc), "path_str": path_str}
+
+                    if modal_result.get("status") == "error":
+                        return {"doc_id": doc_id, "error": modal_result.get("error"), "path_str": path_str}
+
+                    doc_dict = modal_result.get("doc_dict")
+                    if not doc_dict:
+                        return {"doc_id": doc_id, "error": "no doc_dict returned", "path_str": path_str}
+
+                    blocks, triage_info = blocks_from_doc_dict(doc_dict, p, doc_id)
+                    if not blocks:
+                        return {"doc_id": doc_id, "error": "no_blocks", "path_str": path_str}
+
+                    text = "\n\n".join(b.text for b in blocks if b.text)
+                    if not text.strip():
+                        return {"doc_id": doc_id, "error": "empty_text", "path_str": path_str}
+
+                    if args.min_words and len(re.findall(r"[A-Za-z]{2,}", text)) < args.min_words:
+                        return {"doc_id": doc_id, "error": "below_min_words", "path_str": path_str}
+
+                    # Chunk locally
+                    overlap_sentences = max(1, args.overlap // 80 if args.overlap else 1)
+                    from ingest_worker import _select_chunk_profile
+                    chunk_profile = _select_chunk_profile(blocks)
+                    chunks, raw_text = _chunk_blocks(
+                        blocks, args.max_chars,
+                        overlap_sentences=overlap_sentences, profile=chunk_profile,
                     )
-                    if same_hash:
-                        continue
-                    if args.delete_changed:
-                        qdrant_delete_by_doc_id(qdrant_client, args.qdrant_collection, doc_id)
 
-                ids: List[str] = []
-                payloads: List[Dict[str, Any]] = []
-                for chunk in chunks:
-                    s = int(chunk.get("chunk_start", 0) or 0)
-                    e = int(chunk.get("chunk_end", 0) or 0)
-                    chunk_uuid = uuid.uuid5(uuid.UUID(doc_id), f"{s}-{e}")
-                    ids.append(str(chunk_uuid))
-                    payload = {
+                    if not raw_text.strip():
+                        raw_text = text
+                    content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+                    source_path = _translate_path(path_str, args.source_prefix, args.display_prefix)
+
+                    return {
                         "doc_id": doc_id,
-                        "path": path_str,
-                        "chunk_start": s,
-                        "chunk_end": e,
+                        "path_str": path_str,
                         "filename": p.name,
-                        "mtime": mtime,
+                        "source_path": source_path,
                         "content_hash": content_hash,
-                        "page_numbers": chunk.get("pages", []),
-                        "section_path": chunk.get("section_path", []),
-                        "element_ids": chunk.get("element_ids", []),
-                        "bboxes": chunk.get("bboxes", []),
-                        "types": chunk.get("types", []),
-                        "source_tools": chunk.get("source_tools", []),
-                        "table_headers": chunk.get("headers", []),
-                        "table_units": chunk.get("units", []),
-                        "chunk_profile": chunk.get("profile"),
-                        "plan_hash": plan_hash,
-                        "model_version": plan_payload.get("model_version"),
-                        "prompt_sha": plan_payload.get("prompt_sha"),
-                        "doc_metadata": chunk.get("doc_metadata", doc_metadata),  # Use per-chunk metadata (includes dynamic_entities)
-                        "text": chunk.get("text", ""),
+                        "mtime": int(stat.st_mtime),
+                        "file_size": stat.st_size,
+                        "mtime_ns": stat.st_mtime_ns,
+                        "triage_info": triage_info,
+                        "chunks": chunks,
+                        "texts": [c.get("text", "") for c in chunks],
+                        "chunk_profile": chunk_profile,
+                        "error": None,
                     }
-                    if sparse_expander and chunk.get("sparse_terms"):
-                        payload["sparse_terms"] = chunk.get("sparse_terms")
-                    if args.thin_payload:
-                        payload["thin_payload"] = True
-                        payload.pop("text", None)
-                    payloads.append(payload)
 
-                # Vector upsert path
-                upserted_vecs = 0
+                with ThreadPoolExecutor(max_workers=args.parallel_docs) as executor:
+                    futures = {executor.submit(_modal_extract_and_chunk, str(p)): p for p in files}
+                    for future in tqdm(as_completed(futures), total=len(futures), desc="Extracting (Modal)"):
+                        result = future.result()
+                        if result.get("error"):
+                            p = futures[future]
+                            if result["error"] not in ("no_blocks", "empty_text", "below_min_words"):
+                                print(f"ERR {p}: {result['error']}")
+                                errors += 1
+                            continue
+                        extracted.append(result)
+
+            else:
+                # Local: CPU-bound Docling, use ProcessPool
+                import multiprocessing
+                from concurrent.futures import ProcessPoolExecutor, as_completed
+                from ingest_worker import process_single_document
+
+                try:
+                    multiprocessing.set_start_method("spawn", force=True)
+                except RuntimeError:
+                    pass  # Already set
+
+                print(f"Parallel mode: {args.parallel_docs} workers for extraction+chunking")
+
+                with ProcessPoolExecutor(max_workers=args.parallel_docs) as executor:
+                    futures = {
+                        executor.submit(
+                            process_single_document,
+                            str(p), args.max_chars, args.overlap, args.min_words,
+                            args.source_prefix, args.display_prefix,
+                            str(PLAN_DIR),
+                        ): p
+                        for p in files
+                    }
+                    for future in tqdm(as_completed(futures), total=len(futures), desc="Extracting"):
+                        result = future.result()
+                        if result.get("error"):
+                            p = futures[future]
+                            if result["error"] not in ("no_blocks", "empty_text", "below_min_words"):
+                                print(f"ERR {p}: {result['error']}")
+                                errors += 1
+                            continue
+                        extracted.append(result)
+
+            if not extracted:
+                print("No documents extracted successfully.")
+            else:
+                # Pre-embedding content-hash filter: skip docs whose content hasn't changed
+                if args.changed_only and not args.fts_only:
+                    before_count = len(extracted)
+                    filtered = []
+                    for result in extracted:
+                        doc_id = result["doc_id"]
+                        content_hash = result["content_hash"]
+                        same_hash = qdrant_any_by_filter(
+                            qdrant_client, args.qdrant_collection,
+                            [{"key": "doc_id", "value": doc_id}, {"key": "content_hash", "value": content_hash}],
+                        )
+                        if same_hash:
+                            continue
+                        filtered.append(result)
+                    if before_count != len(filtered):
+                        print(f"Content-hash filter: {before_count - len(filtered)} unchanged, {len(filtered)} to embed")
+                    extracted = filtered
+
+                # Stage 2: Centralized embedding (cross-document batching)
                 if not args.fts_only:
-                    if args.embed_robust:
-                        n = len(chunks)
-                        win = max(1, int(args.embed_window_size))
-                        for start in range(0, n, win):
-                            end = min(start + win, n)
-                            subset = chunks[start:end]
-                            texts_w = [c.get("text", "") for c in subset]
-                            vecs_w = embed_texts_robust(
-                                args.ollama_url,
-                                args.ollama_model,
-                                texts_w,
-                                timeout=args.ollama_timeout,
-                                normalize=(args.metric == "cosine"),
-                                num_threads=args.ollama_threads,
-                                keep_alive=args.ollama_keepalive,
-                                max_retries=2,
-                            )
-                            # Filter successful ones
-                            ok_indices = [i for i, v in enumerate(vecs_w) if v is not None]
-                            if ok_indices:
-                                sel_ids = [ids[start + i] for i in ok_indices]
-                                sel_payloads = [payloads[start + i] for i in ok_indices]
-                                sel_vecs = [vecs_w[i] for i in ok_indices]
-                                upsert_qdrant(qdrant_client, args.qdrant_collection, sel_vecs, sel_payloads, sel_ids)
-                                upserted_vecs += len(sel_ids)
+                    print(f"Embedding {sum(len(r['texts']) for r in extracted)} chunks from {len(extracted)} documents...")
+                    all_texts = []
+                    text_map = []  # (result_idx, chunk_idx)
+                    for ri, result in enumerate(extracted):
+                        for ci, text in enumerate(result["texts"]):
+                            all_texts.append(text)
+                            text_map.append((ri, ci))
+
+                    if args.embed_provider == "tei" and args.tei_embed_url:
+                        from modal_services import embed_texts_tei
+                        all_vectors = embed_texts_tei(
+                            args.tei_embed_url, all_texts,
+                            batch_size=args.batch_size,
+                            timeout=args.ollama_timeout,
+                            normalize=(args.metric == "cosine"),
+                        )
                     else:
-                        # Stage 4: Embedding
-                        stage_start = time_module.time()
-                        tqdm.write(f"  [4/5] Embedding: {len(chunks)} chunks")
-                        vecs = embed_texts(
-                            args.ollama_url,
-                            args.ollama_model,
-                            [c.get("text", "") for c in chunks],
+                        all_vectors = embed_texts(
+                            args.ollama_url, args.ollama_model, all_texts,
                             batch_size=args.batch_size,
                             timeout=args.ollama_timeout,
                             normalize=(args.metric == "cosine"),
@@ -699,81 +954,192 @@ def main():
                             keep_alive=args.ollama_keepalive,
                             force_per_item=args.ollama_per_item,
                         )
-                        embedding_time = time_module.time() - stage_start
-                        tqdm.write(f"  ✓ Embedding completed in {embedding_time:.1f}s")
 
-                        # Stage 5: Upserting
-                        stage_start = time_module.time()
-                        tqdm.write(f"  [5/5] Upserting to Qdrant: {len(ids)} vectors")
-                        upsert_qdrant(qdrant_client, args.qdrant_collection, vecs, payloads, ids)
-                        upserted_vecs = len(ids)
-                        upserting_time = time_module.time() - stage_start
-                        tqdm.write(f"  ✓ Upserting completed in {upserting_time:.1f}s")
+                    # Scatter vectors back to per-document results
+                    for vec, (ri, ci) in zip(all_vectors, text_map):
+                        if "vectors" not in extracted[ri]:
+                            extracted[ri]["vectors"] = [None] * len(extracted[ri]["texts"])
+                        extracted[ri]["vectors"][ci] = vec
 
-                # Also upsert into local FTS index (lexical)
-                if not args.no_fts and fts_writer is not None:
+                # Stage 3: Sequential writes (Qdrant + FTS + graph)
+                for result in tqdm(extracted, desc="Upserting"):
                     try:
-                        fts_writer.delete_doc(doc_id)
-                        rows = []
-                        for i, chunk in enumerate(chunks):
-                            s = int(chunk.get("chunk_start", 0) or 0)
-                            e = int(chunk.get("chunk_end", 0) or 0)
-                            t = chunk.get("text", "")
-                            pages = chunk.get("pages", [])
-                            section_path = chunk.get("section_path", [])
-                            element_ids = chunk.get("element_ids", [])
-                            bboxes = chunk.get("bboxes", [])
-                            types = chunk.get("types", [])
-                            source_tools = chunk.get("source_tools", [])
-                            table_headers = chunk.get("headers", [])
-                            table_units = chunk.get("units", [])
-                            profile_tag = chunk.get("profile") or ""
-                            doc_metadata_payload = chunk.get("doc_metadata") or {}
-                            rows.append({
-                                "text": t,
-                                "chunk_id": ids[i],
-                                "doc_id": doc_id,
-                                "path": path_str,
-                                "filename": p.name,
-                                "chunk_start": s,
-                                "chunk_end": e,
-                                "mtime": mtime,
-                                "page_numbers": ",".join(str(n) for n in pages) if pages else "",
-                                "pages": json.dumps(pages, ensure_ascii=False),
-                                "section_path": json.dumps(section_path, ensure_ascii=False) if section_path else "",
-                                "element_ids": json.dumps(element_ids, ensure_ascii=False) if element_ids else "",
-                                "bboxes": json.dumps(bboxes, ensure_ascii=False) if bboxes else "",
-                                "types": json.dumps(types, ensure_ascii=False) if types else "",
-                                "source_tools": json.dumps(source_tools, ensure_ascii=False) if source_tools else "",
-                                "table_headers": json.dumps(table_headers, ensure_ascii=False) if table_headers else "",
-                                "table_units": json.dumps(table_units, ensure_ascii=False) if table_units else "",
-                                "chunk_profile": profile_tag,
-                                "plan_hash": plan_hash,
-                                "model_version": plan_payload.get("model_version", ""),
-                                "prompt_sha": plan_payload.get("prompt_sha", ""),
-                                "doc_metadata": json.dumps(doc_metadata_payload, ensure_ascii=False) if doc_metadata_payload else "",
-                                "sparse_terms": chunk.get("sparse_terms", []),
-                            })
-                        fts_writer.upsert_many(rows)
-                    except Exception as fex:
-                        print(f"WARN: FTS upsert failed for {p}: {fex}")
+                        doc_id = result["doc_id"]
+                        path_str = result["path_str"]
+                        chunks = result["chunks"]
+                        p = pathlib.Path(result["path_str"])
 
-                processed_docs += 1
-                processed_chunks += (len(ids) if args.fts_only else upserted_vecs)
+                        ids_payloads = _finalize_and_upsert(
+                            p, doc_id, path_str, chunks, result["content_hash"],
+                            result["mtime"], result["file_size"], result["mtime_ns"],
+                            result["source_path"], result["chunk_profile"],
+                            result.get("doc_metadata") or {}, result.get("metadata_rejects") or [],
+                            result.get("existing_plan"), result.get("triage_info") or {},
+                        )
+                        if isinstance(ids_payloads, tuple) and len(ids_payloads) == 2:
+                            ids, payloads = ids_payloads
+                            if not ids:
+                                continue
+                        else:
+                            continue
 
-                # Opportunistic GC to limit memory growth on very long runs
-                if processed_docs % 10 == 0:
-                    gc.collect()
+                        # Upsert vectors
+                        upserted_vecs = 0
+                        if not args.fts_only and result.get("vectors"):
+                            vecs = result["vectors"]
+                            upsert_qdrant(qdrant_client, args.qdrant_collection, vecs, payloads, ids)
+                            upserted_vecs = len(ids)
 
-                # Respect file-queue limit
-                if args.max_docs_per_run and processed_docs >= args.max_docs_per_run:
-                    break
+                        # FTS batching
+                        if not args.no_fts and fts_writer is not None:
+                            plan_hash = chunks[0].get("plan_hash", "") if chunks else ""
+                            fts_rows = _build_fts_rows(
+                                doc_id, path_str, result["filename"],
+                                result["source_path"], result["mtime"],
+                                chunks, ids,
+                                {"model_version": INGEST_MODEL_VERSION, "prompt_sha": INGEST_PROMPT_SHA},
+                                plan_hash,
+                            )
+                            fts_buffer.extend(fts_rows)
+                            fts_doc_ids.add(doc_id)
+                            if len(fts_doc_ids) >= FTS_FLUSH_INTERVAL:
+                                _flush_fts()
 
-            except Exception as ex:
-                print(f"ERR {p}: {ex}")
-                errors += 1
-                # Continue trying other files
-                continue
+                        processed_docs += 1
+                        processed_chunks += (len(ids) if args.fts_only else upserted_vecs)
+
+                        if processed_docs % 10 == 0:
+                            gc.collect()
+                        if args.max_docs_per_run and processed_docs >= args.max_docs_per_run:
+                            break
+
+                    except Exception as ex:
+                        print(f"ERR upsert {result.get('path_str', '?')}: {ex}")
+                        errors += 1
+
+            _flush_fts()
+
+        else:
+            # ---- Serial path (original behavior, --parallel-docs 1) ----
+            import time as time_module
+
+            for p in tqdm(files, desc="Ingesting"):
+                try:
+                    doc_id = str(uuid.uuid5(uuid.NAMESPACE_URL, file_uri(p)))
+                    path_str = p.resolve().as_posix()
+
+                    if args.skip_existing:
+                        if qdrant_any_by_filter(qdrant_client, args.qdrant_collection, [{"key": "doc_id", "value": doc_id}]):
+                            continue
+
+                    stage_start = time_module.time()
+
+                    existing_plan = None
+                    plan_override = None
+
+                    if args.extract_provider == "modal" and args.modal_extract_url:
+                        from modal_services import extract_via_modal
+                        from ingest_blocks import blocks_from_doc_dict
+
+                        modal_result = extract_via_modal(str(p), args.modal_extract_url)
+                        doc_dict = modal_result.get("doc_dict")
+                        if not doc_dict:
+                            tqdm.write(f"  Modal extraction failed: {modal_result.get('error', 'no doc_dict')}")
+                            errors += 1
+                            continue
+                        triage_blocks, triage_info = blocks_from_doc_dict(doc_dict, p, doc_id)
+                        tqdm.write(f"  [1/5] Extracting: {p.name} (provider: modal, OCR: {'ON' if modal_result.get('needs_ocr') else 'OFF'})")
+                    else:
+                        existing_plan = load_ingest_plan(doc_id)
+                        plan_override = existing_plan.get("triage") if isinstance(existing_plan, dict) else None
+                        triage_blocks, triage_info = extract_document_blocks(p, doc_id, plan_override=plan_override)
+                        tier_used = triage_info.get("tier", "UNKNOWN") if isinstance(triage_info, dict) else "UNKNOWN"
+                        ocr_enabled = "ON" if (isinstance(triage_info, dict) and triage_info.get("ocr_enabled")) else "OFF"
+                        tqdm.write(f"  [1/5] Extracting: {p.name} (tier: {tier_used}, OCR: {ocr_enabled})")
+
+                    extraction_time = time_module.time() - stage_start
+                    tqdm.write(f"  ✓ Extraction completed in {extraction_time:.1f}s")
+
+                    if not triage_blocks:
+                        continue
+                    text = "\n\n".join(b.text for b in triage_blocks if b.text)
+                    if not text.strip():
+                        continue
+                    if args.min_words and alpha_word_count(text) < args.min_words:
+                        continue
+
+                    overlap_sentences = max(1, args.overlap // 80 if args.overlap else 1)
+                    if plan_override and isinstance(plan_override, dict):
+                        params = existing_plan.get("chunk_params") if isinstance(existing_plan, dict) else None
+                        if isinstance(params, dict):
+                            overlap_sentences = int(params.get("overlap_sentences", overlap_sentences) or overlap_sentences)
+
+                    stage_start = time_module.time()
+                    chunk_profile = (
+                        existing_plan.get("chunk_profile")
+                        if isinstance(existing_plan, dict) and existing_plan.get("chunk_profile")
+                        else select_chunk_profile(triage_blocks)
+                    )
+                    chunks, raw_text = chunk_blocks(
+                        triage_blocks, args.max_chars,
+                        overlap_sentences=overlap_sentences, profile=chunk_profile,
+                    )
+                    tqdm.write(f"  ✓ Chunking {len(chunks)} chunks in {time_module.time() - stage_start:.1f}s")
+
+                    if not raw_text.strip():
+                        raw_text = text
+                    content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+                    stat_info = p.stat()
+                    mtime = int(stat_info.st_mtime)
+                    file_size = stat_info.st_size
+                    mtime_ns = stat_info.st_mtime_ns
+                    source_path = translate_path(path_str, args.source_prefix, args.display_prefix)
+
+                    doc_metadata, metadata_rejects = generate_metadata(raw_text, chunks)
+
+                    ids_payloads = _finalize_and_upsert(
+                        p, doc_id, path_str, chunks, content_hash,
+                        mtime, file_size, mtime_ns, source_path,
+                        chunk_profile, doc_metadata, metadata_rejects,
+                        existing_plan, triage_info,
+                    )
+                    if isinstance(ids_payloads, tuple) and len(ids_payloads) == 2:
+                        ids, payloads = ids_payloads
+                        if not ids:
+                            continue
+                    else:
+                        continue
+
+                    upserted_vecs = _embed_and_upsert_qdrant(chunks, ids, payloads)
+
+                    # FTS batching
+                    if not args.no_fts and fts_writer is not None:
+                        plan_hash = chunks[0].get("plan_hash", "") if chunks else ""
+                        fts_rows = _build_fts_rows(
+                            doc_id, path_str, p.name, source_path, mtime,
+                            chunks, ids,
+                            {"model_version": INGEST_MODEL_VERSION, "prompt_sha": INGEST_PROMPT_SHA},
+                            plan_hash,
+                        )
+                        fts_buffer.extend(fts_rows)
+                        fts_doc_ids.add(doc_id)
+                        if len(fts_doc_ids) >= FTS_FLUSH_INTERVAL:
+                            _flush_fts()
+
+                    processed_docs += 1
+                    processed_chunks += (len(ids) if args.fts_only else upserted_vecs)
+
+                    if processed_docs % 10 == 0:
+                        gc.collect()
+                    if args.max_docs_per_run and processed_docs >= args.max_docs_per_run:
+                        break
+
+                except Exception as ex:
+                    print(f"ERR {p}: {ex}")
+                    errors += 1
+                    continue
+
+            _flush_fts()
 
     finally:
         if fts_writer is not None:

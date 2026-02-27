@@ -21,6 +21,7 @@ FTS_EXPECTED_UNINDEXED = {
     "doc_id": "UNINDEXED",
     "path": "UNINDEXED",
     "filename": "UNINDEXED",
+    "source_path": "UNINDEXED",
     "chunk_start": "UNINDEXED",
     "chunk_end": "UNINDEXED",
     "mtime": "UNINDEXED",
@@ -62,6 +63,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
     doc_id UNINDEXED,
     path UNINDEXED,
     filename UNINDEXED,
+    source_path UNINDEXED,
     chunk_start UNINDEXED,
     chunk_end UNINDEXED,
     mtime UNINDEXED,
@@ -107,22 +109,26 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute(SPARSE_CHUNK_INDEX_SQL)
         conn.commit()
         return
-    # Existing table: ensure expected columns are present.
+    # Existing table: check for missing columns.
+    # NOTE: FTS5 virtual tables do NOT support ALTER TABLE ADD COLUMN.
+    # If columns are missing, warn and suggest --fts-rebuild for full re-ingestion.
     current_columns = set()
     for row in conn.execute("PRAGMA table_xinfo('fts_chunks')"):
         name = row[1]
         if name:
             current_columns.add(name)
     missing = [col for col in FTS_EXPECTED_UNINDEXED if col not in current_columns]
-    for col in missing:
-        conn.execute(f"ALTER TABLE fts_chunks ADD COLUMN {col} {FTS_EXPECTED_UNINDEXED[col]}")
+    if missing:
+        import sys
+        print(
+            f"WARN: FTS table missing columns: {missing}. "
+            "FTS5 virtual tables cannot be altered. Use --fts-rebuild to recreate with full schema.",
+            file=sys.stderr,
+        )
     conn.execute(SPARSE_CREATE_SQL)
     conn.execute(SPARSE_INDEX_SQL)
     conn.execute(SPARSE_CHUNK_INDEX_SQL)
-    if missing:
-        conn.commit()
-    else:
-        conn.commit()
+    conn.commit()
 
 
 def _ensure_parent_dir(path: str) -> None:
@@ -200,6 +206,17 @@ class FTSWriter:
         cur.execute(SPARSE_CHUNK_INDEX_SQL)
         self.conn.commit()
 
+    def _get_fts_columns(self) -> list:
+        """Return the actual columns in the fts_chunks table (cached)."""
+        if not hasattr(self, "_fts_columns"):
+            cols = []
+            for row in self.conn.execute("PRAGMA table_xinfo('fts_chunks')"):
+                name = row[1]
+                if name:
+                    cols.append(name)
+            self._fts_columns = cols
+        return self._fts_columns
+
     def upsert_many(self, rows: Iterable[Dict[str, Any]], batch_size: int = 2000, show_progress: bool = False) -> int:
         """
         Upsert chunks with batched commits to prevent WAL bloat.
@@ -216,6 +233,21 @@ class FTSWriter:
         if not rows:
             return 0
 
+        # Determine actual columns in FTS table for graceful fallback on old schemas
+        actual_cols = self._get_fts_columns()
+        full_cols = [
+            "text", "chunk_id", "doc_id", "path", "filename", "source_path",
+            "chunk_start", "chunk_end", "mtime", "page_numbers",
+            "pages", "section_path", "element_ids", "bboxes",
+            "types", "source_tools", "table_headers", "table_units",
+            "chunk_profile", "plan_hash", "model_version", "prompt_sha", "doc_metadata",
+        ]
+        # Only insert columns that exist in the table (handles pre-rebuild DBs)
+        insert_cols = [c for c in full_cols if c in actual_cols]
+        placeholders = ", ".join("?" for _ in insert_cols)
+        col_list = ", ".join(insert_cols)
+        insert_sql = f"INSERT INTO fts_chunks ({col_list}) VALUES ({placeholders})"
+
         cur = self.conn.cursor()
         total_inserted = 0
 
@@ -231,45 +263,15 @@ class FTSWriter:
                 [(str(r.get("chunk_id")),) for r in batch],
             )
 
-            # Insert batch
+            # Insert batch — extract values for only the columns that exist
+            def _row_val(r, col):
+                if col in ("chunk_start", "chunk_end", "mtime"):
+                    return int(r.get(col, 0) or 0)
+                return str(r.get(col, "") or "")
+
             cur.executemany(
-                """
-                INSERT INTO fts_chunks (
-                    text, chunk_id, doc_id, path, filename,
-                    chunk_start, chunk_end, mtime, page_numbers,
-                    pages, section_path, element_ids, bboxes,
-                    types, source_tools, table_headers, table_units,
-                    chunk_profile, plan_hash, model_version, prompt_sha, doc_metadata
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        r.get("text", ""),
-                        str(r.get("chunk_id")),
-                        str(r.get("doc_id")),
-                        str(r.get("path")),
-                        str(r.get("filename")),
-                        int(r.get("chunk_start", 0) or 0),
-                        int(r.get("chunk_end", 0) or 0),
-                        int(r.get("mtime", 0) or 0),
-                        str(r.get("page_numbers", "") or ""),
-                        str(r.get("pages", "") or ""),
-                        str(r.get("section_path", "") or ""),
-                        str(r.get("element_ids", "") or ""),
-                        str(r.get("bboxes", "") or ""),
-                        str(r.get("types", "") or ""),
-                        str(r.get("source_tools", "") or ""),
-                        str(r.get("table_headers", "") or ""),
-                        str(r.get("table_units", "") or ""),
-                        str(r.get("chunk_profile", "") or ""),
-                        str(r.get("plan_hash", "") or ""),
-                        str(r.get("model_version", "") or ""),
-                        str(r.get("prompt_sha", "") or ""),
-                        str(r.get("doc_metadata", "") or ""),
-                    )
-                    for r in batch
-                ],
+                insert_sql,
+                [tuple(_row_val(r, c) for c in insert_cols) for r in batch],
             )
 
             # Process sparse terms for this batch
@@ -319,13 +321,19 @@ class FTSWriter:
 
         return total_inserted
 
-    def delete_doc(self, doc_id: str) -> None:
+    def delete_doc(self, doc_id: str, commit: bool = True) -> None:
         if not doc_id:
             return
         cur = self.conn.cursor()
         cur.execute("DELETE FROM fts_chunks WHERE doc_id = ?", (str(doc_id),))
         cur.execute("DELETE FROM fts_chunks_sparse WHERE doc_id = ?", (str(doc_id),))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
+
+    def commit(self) -> None:
+        """Explicit commit for batched operations."""
+        if self.conn is not None:
+            self.conn.commit()
 
     def close(self) -> None:
         if self.conn is not None:
@@ -383,13 +391,13 @@ def upsert_chunks(db_path: str, rows: Iterable[Dict[str, Any]]) -> int:
             cur.execute(
                 """
                 INSERT INTO fts_chunks (
-                    text, chunk_id, doc_id, path, filename,
+                    text, chunk_id, doc_id, path, filename, source_path,
                     chunk_start, chunk_end, mtime, page_numbers,
                     pages, section_path, element_ids, bboxes,
                     types, source_tools, table_headers, table_units,
                     chunk_profile, plan_hash, model_version, prompt_sha, doc_metadata
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     r.get("text", ""),
@@ -397,6 +405,7 @@ def upsert_chunks(db_path: str, rows: Iterable[Dict[str, Any]]) -> int:
                     doc_id,
                     str(r.get("path")),
                     str(r.get("filename")),
+                    str(r.get("source_path", "") or ""),
                     int(r.get("chunk_start", 0) or 0),
                     int(r.get("chunk_end", 0) or 0),
                     int(r.get("mtime", 0) or 0),
@@ -478,7 +487,7 @@ def search(db_path: str, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         # Order by bm25() ASC for best first
         cur.execute(
             """
-            SELECT chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime, page_numbers,
+            SELECT chunk_id, doc_id, path, filename, source_path, chunk_start, chunk_end, mtime, page_numbers,
                    pages, section_path, element_ids, bboxes, types, source_tools,
                    table_headers, table_units, chunk_profile, plan_hash, model_version, prompt_sha, doc_metadata,
                    text,
@@ -551,7 +560,7 @@ def fetch_texts_by_chunk_ids(db_path: str, chunk_ids: Iterable[str]) -> Dict[str
         placeholders = ",".join("?" for _ in ids)
         cur.execute(
             f"""
-            SELECT chunk_id, text, doc_id, path, filename, chunk_start, chunk_end, page_numbers, mtime,
+            SELECT chunk_id, text, doc_id, path, filename, source_path, chunk_start, chunk_end, page_numbers, mtime,
                    pages, section_path, element_ids, bboxes, types, source_tools,
                    table_headers, table_units, chunk_profile, plan_hash, model_version, prompt_sha, doc_metadata
             FROM fts_chunks

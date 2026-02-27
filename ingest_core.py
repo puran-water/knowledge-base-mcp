@@ -23,6 +23,21 @@ except ImportError as exc:  # pragma: no cover - qdrant is a runtime dependency
     raise RuntimeError("qdrant-client is required for ingestion") from exc
 
 
+_SESSION: Optional[requests.Session] = None
+
+
+def _get_session() -> requests.Session:
+    """Return a shared requests.Session with connection pooling."""
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = requests.Session()
+        from requests.adapters import HTTPAdapter
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=10)
+        _SESSION.mount("http://", adapter)
+        _SESSION.mount("https://", adapter)
+    return _SESSION
+
+
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "snowflake-arctic-embed:xs")
 DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -65,7 +80,7 @@ def embed_texts(
         return embeddings
     if total <= 1 or force_per_item:
         for text in texts:
-            r = requests.post(
+            r = _get_session().post(
                 f"{ollama_url}/api/embeddings",
                 json={"model": model, "prompt": text, "keep_alive": keep_alive, "options": {"num_thread": num_threads}},
                 timeout=timeout,
@@ -94,7 +109,7 @@ def embed_texts(
             }
             for attempt in range(3):
                 try:
-                    r = requests.post(
+                    r = _get_session().post(
                         f"{ollama_url}/api/embed",
                         json=payload,
                         timeout=timeout,
@@ -133,7 +148,7 @@ def embed_texts_robust(
     for i, text in enumerate(texts):
         for attempt in range(max_retries + 1):
             try:
-                r = requests.post(
+                r = _get_session().post(
                     f"{ollama_url}/api/embeddings",
                     json={"model": model, "prompt": text, "keep_alive": keep_alive, "options": {"num_thread": num_threads}},
                     timeout=timeout,
@@ -256,6 +271,52 @@ def qdrant_delete_by_doc_id(client: QdrantClient, collection: str, doc_id: str) 
     client.delete(collection_name=collection, points_selector=models.FilterSelector(filter=flt))
 
 
+def qdrant_batch_doc_metadata(
+    client: QdrantClient,
+    collection: str,
+    doc_ids: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Batch fetch mtime_ns + file_size for doc_ids from Qdrant.
+
+    Returns {doc_id: {"mtime_ns": ..., "file_size": ..., "content_hash": ...}}.
+    Only fetches one point per doc_id to minimize data transfer.
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    if not doc_ids:
+        return result
+    # Process in batches to avoid very large scroll requests
+    BATCH = 100
+    for i in range(0, len(doc_ids), BATCH):
+        batch_ids = doc_ids[i : i + BATCH]
+        for doc_id in batch_ids:
+            try:
+                flt = models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="doc_id",
+                            match=models.MatchValue(value=doc_id),
+                        )
+                    ]
+                )
+                points, _ = client.scroll(
+                    collection_name=collection,
+                    scroll_filter=flt,
+                    limit=1,
+                    with_payload=["mtime_ns", "file_size", "content_hash"],
+                    with_vectors=False,
+                )
+                if points:
+                    pl = points[0].payload or {}
+                    result[doc_id] = {
+                        "mtime_ns": pl.get("mtime_ns"),
+                        "file_size": pl.get("file_size"),
+                        "content_hash": pl.get("content_hash"),
+                    }
+            except Exception:
+                continue
+    return result
+
+
 def _load_json(path: Union[str, Path]) -> Dict[str, Any]:
     p = Path(path).expanduser()
     if not p.exists():
@@ -351,11 +412,17 @@ def upsert_document_artifacts(
 
     filename = ""
     mtime = int(time.time())
+    file_size = 0
+    mtime_ns = 0
+    source_path_str = chunk_data.get("source_path") or ""
     if path_str:
         path_obj = Path(path_str)
         filename = path_obj.name
         try:
-            mtime = int(path_obj.stat().st_mtime)
+            st = path_obj.stat()
+            mtime = int(st.st_mtime)
+            file_size = st.st_size
+            mtime_ns = st.st_mtime_ns
         except Exception:
             pass
 
@@ -384,7 +451,10 @@ def upsert_document_artifacts(
             "chunk_start": chunk_start,
             "chunk_end": chunk_end,
             "filename": filename,
+            "source_path": source_path_str or None,
             "mtime": mtime,
+            "file_size": file_size,
+            "mtime_ns": mtime_ns,
             "content_hash": content_hash,
             "page_numbers": pages,
             "section_path": section_path,
@@ -479,6 +549,7 @@ def upsert_document_artifacts(
                     "doc_id": doc_id,
                     "path": path_str,
                     "filename": filename,
+                    "source_path": source_path_str or "",
                     "chunk_start": payload.get("chunk_start"),
                     "chunk_end": payload.get("chunk_end"),
                     "mtime": mtime,
@@ -549,5 +620,6 @@ __all__ = [
     "upsert_qdrant",
     "qdrant_any_by_filter",
     "qdrant_delete_by_doc_id",
+    "qdrant_batch_doc_metadata",
     "upsert_document_artifacts",
 ]

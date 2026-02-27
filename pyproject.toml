@@ -1,0 +1,30 @@
+[project]
+name = "knowledge-base"
+version = "1.0.0"
+description = "MCP server for semantic search over engineering knowledge bases"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "fastmcp>=0.1.0",
+    "pydantic>=2.0.0",
+    "qdrant-client",
+    "requests",
+    "httpx>=0.25.0",
+    "numpy",
+    "tqdm",
+    "pymupdf",
+    "markitdown[all]",
+    "yake",
+]
+
+[project.optional-dependencies]
+ml = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+    "sentencepiece",
+    "ragatouille<0.0.10",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
