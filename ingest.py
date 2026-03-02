@@ -453,6 +453,13 @@ def main():
         print("No files found to ingest.")
         return
 
+    # Truncate file list early if --max-docs-per-run is set, so parallel
+    # extraction doesn't submit work beyond the limit.
+    if args.max_docs_per_run and args.max_docs_per_run > 0:
+        if len(files) > args.max_docs_per_run:
+            print(f"Limiting to {args.max_docs_per_run} of {len(files)} discovered files (--max-docs-per-run)")
+            files = files[:args.max_docs_per_run]
+
     # Fast-path incremental skip: compare mtime_ns + file_size via stat()
     # before extraction. Skips unchanged files in ~1ms instead of ~2-5s.
     if args.changed_only and not args.fts_only:

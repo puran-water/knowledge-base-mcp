@@ -257,11 +257,17 @@ class FTSWriter:
             batch_end = min(batch_start + batch_size, len(rows))
             batch = rows[batch_start:batch_end]
 
-            # Delete existing by chunk_id
-            cur.executemany(
-                "DELETE FROM fts_chunks WHERE chunk_id = ?",
-                [(str(r.get("chunk_id")),) for r in batch],
-            )
+            # Delete existing by chunk_id — use batched IN clause instead of
+            # executemany to avoid O(N * table_size) full table scans.
+            # FTS5 virtual tables have no B-tree index on non-rowid columns,
+            # so each individual DELETE scans the entire content table.
+            # A single IN clause does ONE scan checking against a hash set.
+            chunk_ids_to_delete = [str(r.get("chunk_id")) for r in batch]
+            _IN_CHUNK = 500  # stay under SQLITE_MAX_VARIABLE_NUMBER
+            for _di in range(0, len(chunk_ids_to_delete), _IN_CHUNK):
+                _sub = chunk_ids_to_delete[_di : _di + _IN_CHUNK]
+                _ph = ",".join("?" * len(_sub))
+                cur.execute(f"DELETE FROM fts_chunks WHERE chunk_id IN ({_ph})", _sub)
 
             # Insert batch — extract values for only the columns that exist
             def _row_val(r, col):

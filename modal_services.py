@@ -34,19 +34,31 @@ def _get_session():
     return _SESSION
 
 
-def _retry_post(url, max_retries=3, backoff=2.0, **kwargs):
-    """POST with exponential backoff for transient Modal errors (cold starts, 503s)."""
+def _retry_post(url, max_retries=5, backoff=2.0, **kwargs):
+    """POST with exponential backoff for transient Modal errors (cold starts, 429s, 502s, 503s)."""
     session = _get_session()
     last_exc = None
     for attempt in range(max_retries):
         try:
             resp = session.post(url, **kwargs)
-            if resp.status_code == 503 and attempt < max_retries - 1:
-                time.sleep(backoff * (2 ** attempt))
+            if resp.status_code in (429, 502, 503) and attempt < max_retries - 1:
+                # Respect Retry-After header if present, otherwise exponential backoff
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    delay = min(float(retry_after), 30.0)
+                else:
+                    delay = backoff * (2 ** attempt)
+                time.sleep(delay)
                 continue
             resp.raise_for_status()
             return resp
         except requests.exceptions.ConnectionError as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+            raise
+        except requests.exceptions.ReadTimeout as exc:
             last_exc = exc
             if attempt < max_retries - 1:
                 time.sleep(backoff * (2 ** attempt))
@@ -63,6 +75,7 @@ def embed_texts_tei(
     batch_size: int = 128,
     timeout: int = 120,
     normalize: bool = True,
+    max_chars: int = 500,
 ) -> list:
     """Embed texts via TEI /embed endpoint (Modal-hosted or local).
 
@@ -72,20 +85,58 @@ def embed_texts_tei(
         batch_size: Texts per request
         timeout: HTTP timeout in seconds
         normalize: L2-normalize vectors
+        max_chars: Truncate texts longer than this to avoid exceeding model's
+            max token limit (512 tokens for Arctic Embed XS ≈ 1500 chars for
+            technical text with ~3 chars/token)
 
     Returns:
         List of embedding vectors
     """
-    embeddings = []
-    endpoint = f"{tei_url.rstrip('/')}/embed"
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
+    # Truncate texts that exceed model's token limit
+    truncated = 0
+    safe_texts = []
+    for t in texts:
+        if len(t) > max_chars:
+            safe_texts.append(t[:max_chars])
+            truncated += 1
+        else:
+            safe_texts.append(t)
+    if truncated:
+        print(f"  TEI: truncated {truncated}/{len(texts)} texts to {max_chars} chars")
+
+    def _embed_batch(batch_texts):
+        """Embed a batch, splitting on 413 errors (token limit exceeded)."""
         resp = _retry_post(
             endpoint,
-            json={"inputs": batch},
+            json={"inputs": batch_texts},
             timeout=timeout,
         )
-        batch_vecs = resp.json()
+        return resp.json()
+
+    def _embed_batch_safe(batch_texts, depth=0):
+        """Embed with automatic bisection on 413 errors."""
+        try:
+            return _embed_batch(batch_texts)
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 413:
+                if len(batch_texts) == 1:
+                    # Single text still too long — aggressively truncate
+                    shorter = batch_texts[0][:max_chars // 2]
+                    print(f"  TEI: single text 413, truncating to {len(shorter)} chars")
+                    return _embed_batch([shorter])
+                # Split batch in half and retry each
+                mid = len(batch_texts) // 2
+                print(f"  TEI: 413 on batch of {len(batch_texts)}, splitting at depth {depth}")
+                left = _embed_batch_safe(batch_texts[:mid], depth + 1)
+                right = _embed_batch_safe(batch_texts[mid:], depth + 1)
+                return left + right
+            raise
+
+    embeddings = []
+    endpoint = f"{tei_url.rstrip('/')}/embed"
+    for i in range(0, len(safe_texts), batch_size):
+        batch = safe_texts[i : i + batch_size]
+        batch_vecs = _embed_batch_safe(batch)
 
         if normalize:
             normalized = []

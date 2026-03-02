@@ -50,6 +50,8 @@ markitdown_cache/
 .cache/
 data/hf_cache/
 data/torch_extensions/
+data/ingest_plans/
+data/ingest_artifacts/
 
 # Distribution / packaging
 build/
