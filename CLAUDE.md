@@ -98,6 +98,38 @@ TEI_EMBED_URL=<tei-url> python3 server.py stdio
 ```
 When `TEI_EMBED_URL` is set, `embed_query()` routes to TEI instead of Ollama. When unset, Ollama is used (default).
 
+#### FTS Backfill Strategy (Recommended for Bulk Ingestion)
+For bulk ingestion, use `--no-fts` during ingestion then backfill FTS from Qdrant afterward. This avoids the FTS DELETE bottleneck that occurs with inline FTS writes during upsert.
+
+```bash
+# Step 1: Ingest with --no-fts (and --no-graph for speed)
+.venv/bin/python3 ingest.py --root /path/to/docs \
+  --qdrant-collection my_collection_kb \
+  --fts-db data/my_collection_kb_fts.db \
+  --no-fts --no-graph ...
+
+# Step 2: Backfill FTS from Qdrant
+.venv/bin/python3 scripts/backfill_fts_from_qdrant_v2.py \
+  --collection my_collection_kb \
+  --fts-db data/my_collection_kb_fts.db \
+  --batch 1000 --fts-batch-size 2000
+```
+
+This produces exact parity between Qdrant points and FTS rows. Always verify after backfill.
+
+#### Multi-Source Ingestion with Dedup
+When a project has overlapping document sources (e.g., "Final Project Documents" canonical copy + working folder), use this workflow:
+
+1. **Ingest canonical source first** (typically smaller, curated)
+2. **Dedup working source against canonical** using filename + file size fingerprinting
+   - Adapt `scripts/dedup_dir1_vs_dir2.py` (Meerut template) or `scripts/dedup_nanded.py`
+   - Output: symlink tree in `data/<project>_unique/` containing only unique files
+   - Add `SKIP_DIRS` set for low-value subdirectories (internship folders, analytics, etc.)
+3. **Ingest unique files** from the symlink tree
+4. **Cleanup** symlink tree after ingestion: `rm -rf data/<project>_unique/`
+
+Typical dedup hit rate: ~10% duplicates removed. Extraction error rate for mixed engineering docs: ~8-10% is normal (unsupported formats, scanned PDFs, corrupted files).
+
 ### For Interactive MCP-Based Ingestion
 Use MCP tools for small-scale interactive work (1-10 documents):
 
@@ -172,23 +204,23 @@ All metadata preserved in both Qdrant vector payloads and FTS database.
    - `kb.table` for row-level answers, `kb.summary` / `kb.outline` if summaries built
    - Graph pivots: `kb.entities`, `kb.linkouts`, `kb.graph`
 
-3. **Quality gating** – `kb.quality(collection=..., min_score=..., require_plan_hash=True, require_table_hit=bool)`
+4. **Quality gating** – `kb.quality(collection=..., min_score=..., require_plan_hash=True, require_table_hit=bool)`
    - If below threshold: rerun with `kb.hint` + `kb.sparse`, rephrase via `kb.batch`, or abstain
 
-4. **HyDE retry (client-side)**
+5. **HyDE retry (client-side)**
    - No `kb.hyde` tool exists
    - After low-score pass (e.g., best score < 0.35), draft 5–7 sentence hypothetical answer
    - Re-run with `kb.dense(query=hypothesis, retrieve_k=..., return_k=...)` and compare telemetry
    - Adopt if improves recall while meeting answerability gates; otherwise revert or abstain
 
-5. **Recency decay** (active by default)
+6. **Recency decay** (active by default)
    - Documents are scored with a recency decay factor: `DECAY_HALF_LIFE_DAYS=180`, `DECAY_STRENGTH=0.15`
    - Documents >6 months old get ~50% decay weight; >1 year ~25%
    - Even very old docs retain 85% minimum score — gently favors newer info without burying authoritative material
    - Override via env vars `DECAY_HALF_LIFE_DAYS=0` to disable, or adjust strength/half-life
    - Use `mtime` in SLIM results (ISO 8601) to explain recency preferences to users
 
-6. **Session priors**
+7. **Session priors**
    - `kb.promote` / `kb.demote` once you've verified document quality in this session
 
 ## Best Practices for Context Retrieval with kb.neighbors
@@ -296,6 +328,25 @@ Reducing below n=10 risks incomplete answers.
 - Server persists provenance to vector/FTS payloads on upsert
 - Do not bypass budgets, rewrite chunk text, or invent missing metadata
 - If unclear, escalate rather than guessing
+
+## Collection Registration
+To add a new collection to the MCP server:
+
+1. **Add to `NOMIC_KB_SCOPES`** in `.mcp.json` — append to the JSON string:
+   ```
+   ,"my_slug":{"collection":"my_collection_kb","title":"Human-Readable Title"}
+   ```
+2. **Naming convention**: slug `my_slug` → Qdrant collection `my_slug_kb` → FTS db `data/my_slug_kb_fts.db`
+3. **Restart MCP server** — new collections are NOT discovered until restart. `kb.collections()` will not show the new entry until then.
+
+## Post-Ingestion Verification
+After completing ingestion + FTS backfill, verify:
+
+1. **Qdrant = FTS parity**: `curl -s http://localhost:6333/collections/<collection>/` → `points_count` must equal FTS row count
+2. **source_path populated**: Check FTS content table for non-null `source_path` on all rows
+3. **Collection status**: Qdrant status should be `green`, `optimizer_status` should be `ok`
+4. **Spot-check search**: `kb.search(query="<domain term>", collection="<slug>")` returns relevant results
+5. **MCP server restart** if collection was newly registered
 
 ## Client-Side HyDE Loop
 1. Run initial search (`kb.search`/`kb.hybrid`) and inspect `best_score` plus telemetry
